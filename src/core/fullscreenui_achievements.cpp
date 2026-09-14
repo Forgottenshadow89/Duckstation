@@ -457,11 +457,11 @@ void FullscreenUI::DrawNotifications(NotificationLayout& layout)
   static constexpr const float& title_font_weight = UIStyle.BoldFontWeight;
   const float normal_text_font_size = ImCeil(LAYOUT_MEDIUM_FONT_SIZE * scale);
   const float small_text_font_size = ImCeil(LAYOUT_MEDIUM_SMALL_FONT_SIZE * scale);
+  const float tiny_text_font_size = ImCeil(LAYOUT_SMALL_FONT_SIZE * scale);
   static constexpr const float& text_font_weight = UIStyle.NormalFontWeight;
   const float note_text_size = ImCeil(LAYOUT_MEDIUM_FONT_SIZE * scale);
   static constexpr const float& note_text_weight = UIStyle.BoldFontWeight;
   const float note_icon_size = ImCeil(LAYOUT_MEDIUM_LARGE_FONT_SIZE * scale);
-  const float category_badge_font_size = ImCeil(LAYOUT_MEDIUM_SMALL_FONT_SIZE * scale);
   const ImVec2 category_badge_padding(ImCeil(5.0f * scale), ImCeil(3.0f * scale));
   const float category_badge_spacing = ImCeil(10.0f * scale);
   const float category_badge_rounding = ImCeil(3.0f * scale);
@@ -536,6 +536,7 @@ void FullscreenUI::DrawNotifications(NotificationLayout& layout)
         break;
     }
 
+    const float category_badge_font_size = notif.small_font ? tiny_text_font_size : small_text_font_size;
     const ImVec2 category_size =
       MeasureAchievementCategoryBadges(notif.category, category_badge_font_size, ACHIEVEMENT_BADGE_FONT_WEIGHT,
                                        category_badge_padding, category_badge_spacing);
@@ -560,9 +561,10 @@ void FullscreenUI::DrawNotifications(NotificationLayout& layout)
       std::max((horizontal_padding * 2.0f) + badge_size.x + horizontal_spacing +
                  ImCeil(std::max(title_size.x + title_trailing_spacing + title_trailing_width, text_size.x)),
                std::max(static_cast<float>(ImCeil(notif.min_width * scale)), min_width));
-    const float box_height =
-      std::max((vertical_padding * 2.0f) + ImCeil(title_size.y) + vertical_spacing + ImCeil(text_size.y),
-               notif.small_font ? small_min_height : normal_min_height);
+    const float box_height = std::max(
+      (vertical_padding * 2.0f) - LayoutScale(notif.small_font ? SMALL_BADGE_TEXT_Y_OFFSET : BADGE_TEXT_Y_OFFSET) +
+        ImCeil(title_size.y) + vertical_spacing + ImCeil(text_size.y),
+      notif.small_font ? small_min_height : normal_min_height);
 
     const auto& [expected_pos, opacity] =
       layout.GetNextPosition(box_width, box_height, time_passed, notif.duration, NOTIFICATION_APPEAR_ANIMATION_TIME,

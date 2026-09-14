@@ -748,6 +748,13 @@ void Achievements::UpdateSettings(const Settings& old_config)
       DisableHardcoreMode(true, true);
   }
 
+  if (!g_settings.achievements_leaderboard_trackers)
+    s_state.active_leaderboard_trackers.clear();
+
+  // remove progress indicator because it won't remove normally
+  if (g_settings.achievements_progress_indicator_mode == AchievementProgressIndicatorMode::Disabled)
+    s_state.active_progress_indicator.reset();
+
   // If a game is active and these settings changed, reload the game to apply them.
   // Just unload and reload without destroying the client to preserve hardcore mode.
   // NOTE: Can't change spectator mode while game is loaded.
@@ -761,19 +768,11 @@ void Achievements::UpdateSettings(const Settings& old_config)
     UpdateModeSettings(old_config);
     BeginLoadGame();
     LoadStateFromBuffer(state_data.cspan(), lock);
-    return;
   }
   else
   {
     UpdateModeSettings(old_config);
   }
-
-  if (!g_settings.achievements_leaderboard_trackers)
-    s_state.active_leaderboard_trackers.clear();
-
-  // remove progress indicator because it won't remove normally
-  if (g_settings.achievements_progress_indicator_mode == AchievementProgressIndicatorMode::Disabled)
-    s_state.active_progress_indicator.reset();
 }
 
 void Achievements::UpdateModeSettings(const Settings& old_config)
@@ -1868,7 +1867,8 @@ void Achievements::LoadStateFromBuffer(std::span<const u8> data, std::unique_loc
 {
   // if we're active, make sure we've downloaded and activated all the achievements
   // before deserializing, otherwise that state's going to get lost.
-  if (s_state.load_game_request)
+  // need to check for login requests too, because game load won't be created until login finishes
+  if (s_state.load_game_request || s_state.login_request)
   {
     // Fallback to game icon if we don't have a cover.
     std::string image = System::GetImageForLoadingScreen(System::GetGamePath());

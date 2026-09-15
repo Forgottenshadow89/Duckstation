@@ -41,6 +41,18 @@ struct CacheIndexEntryHeader
 };
 #pragma pack(pop)
 
+ALWAYS_INLINE bool KeyLess(ObjectArchive::KeySpan lhs, ObjectArchive::KeySpan rhs)
+{
+  const size_t common = std::min(lhs.size(), rhs.size());
+  const int cmp = std::memcmp(lhs.data(), rhs.data(), common);
+  return (cmp < 0 || (cmp == 0 && lhs.size() < rhs.size()));
+}
+
+ALWAYS_INLINE bool KeyEqual(ObjectArchive::KeySpan lhs, ObjectArchive::KeySpan rhs)
+{
+  return (lhs.size() == rhs.size() && std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0);
+}
+
 } // namespace
 
 static constexpr u32 EXPECTED_SIGNATURE = 0x41435544; // DUCA
@@ -50,13 +62,20 @@ ObjectArchive::ObjectArchive() = default;
 
 ObjectArchive::~ObjectArchive()
 {
-  Close();
+  LockedClose();
 }
 
+constinit const std::string_view ObjectArchive::ERROR_DESCRIPTION_NOT_OPEN = "Archive is not open.";
 constinit const std::string_view ObjectArchive::ERROR_DESCRIPTION_DOES_NOT_EXIST = "Key not found in archive.";
 constinit const std::string_view ObjectArchive::ERROR_DESCRIPTION_ALREADY_EXISTS = "Key already exists in archive.";
 
 void ObjectArchive::Close()
+{
+  std::unique_lock lock(m_mutex);
+  LockedClose();
+}
+
+void ObjectArchive::LockedClose()
 {
   if (m_index_file)
   {
@@ -69,10 +88,13 @@ void ObjectArchive::Close()
     m_blob_file = nullptr;
   }
   m_index.clear();
+  m_key_pool.clear();
 }
 
 bool ObjectArchive::Clear(Error* error)
 {
+  std::unique_lock lock(m_mutex);
+
   if (!IsOpen())
     return true;
 
@@ -84,56 +106,77 @@ bool ObjectArchive::Clear(Error* error)
       !FileSystem::FSeek64(m_index_file, 0, SEEK_END, error))
   {
     ERROR_LOG("Failed to seek/truncate object cache");
-    Close();
+    LockedClose();
     return false;
   }
 
   m_index.clear();
+  m_key_pool.clear();
   return true;
 }
 
-bool ObjectArchive::OpenPath(std::string_view base_path, u32 data_version, Error* error)
+size_t ObjectArchive::GetSize() const
 {
-  Close();
+  std::unique_lock lock(m_mutex);
+  return m_index.size();
+}
 
-  const std::string index_filename = fmt::format("{}.idx", base_path);
-  const std::string blob_filename = fmt::format("{}.bin", base_path);
+bool ObjectArchive::OpenPath(std::string_view base_path, u32 data_version, Error* error, bool* was_invalidated)
+{
+  std::unique_lock lock(m_mutex);
 
-  if (FileSystem::FileExists(index_filename.c_str()))
+  LockedClose();
+
+  if (was_invalidated)
+    *was_invalidated = false;
+
+  const std::string index_path = fmt::format("{}.idx", base_path);
+  const std::string blob_path = fmt::format("{}.bin", base_path);
+
+  if (FileSystem::FileExists(index_path.c_str()))
   {
     Error open_error;
-    if (OpenExisting(index_filename, blob_filename, data_version, &open_error))
-      return true;
+    bool was_sharing_violation = false;
+    std::FILE* index_file = FileSystem::OpenCFile(index_path.c_str(), "r+b", &open_error);
+    if (index_file) [[likely]]
+    {
+      std::FILE* blob_file = FileSystem::OpenCFile(blob_path.c_str(), "a+b", &open_error);
+      if (blob_file) [[likely]]
+      {
+        if (ReadExisting(data_version, index_file, blob_file, &open_error))
+          return true;
 
-    ERROR_LOG("Failed to open existing object archive index '{}': {}", Path::GetFileName(index_filename),
+        // ReadExisting() doesn't consume the handles.
+        std::fclose(blob_file);
+        std::fclose(index_file);
+      }
+      else
+      {
+        was_sharing_violation = (errno == EACCES);
+        std::fclose(index_file);
+        ERROR_LOG("Blob file '{}' is missing", Path::GetFileName(blob_path));
+      }
+    }
+    else
+    {
+      was_sharing_violation = (errno == EACCES);
+    }
+
+    // special case here: when there's a sharing violation (i.e. two instances running),
+    // we don't want to blow away the cache. so just continue without a cache.
+    if (was_sharing_violation)
+    {
+      WARNING_LOG("Failed to open archive index with EACCES, are you running two instances?");
+      return true;
+    }
+
+    ERROR_LOG("Failed to open existing object archive index '{}': {}", Path::GetFileName(index_path),
               open_error.GetDescription());
   }
 
-  return CreateNew(index_filename, blob_filename, data_version, error);
-}
+  if (was_invalidated)
+    *was_invalidated = true;
 
-bool ObjectArchive::OpenFile(std::FILE* index_file, std::FILE* blob_file, u32 data_version, Error* error)
-{
-  Close();
-
-  m_index_file = index_file;
-  m_blob_file = blob_file;
-
-  return ReadExisting(data_version, error);
-}
-
-bool ObjectArchive::CreateFile(std::FILE* index_file, std::FILE* blob_file, u32 data_version, Error* error)
-{
-  Close();
-
-  m_index_file = index_file;
-  m_blob_file = blob_file;
-
-  return CreateNew(data_version, error);
-}
-
-bool ObjectArchive::CreateNew(const std::string& index_path, const std::string& blob_path, u32 version, Error* error)
-{
   if (FileSystem::FileExists(blob_path.c_str()))
   {
     WARNING_LOG("Removing existing blob file '{}'", Path::GetFileName(blob_path));
@@ -145,26 +188,27 @@ bool ObjectArchive::CreateNew(const std::string& index_path, const std::string& 
     FileSystem::DeleteFile(index_path.c_str());
   }
 
-  m_index_file = FileSystem::OpenCFile(index_path.c_str(), "wb", error);
-  if (!m_index_file) [[unlikely]]
+  std::FILE* index_file = FileSystem::OpenCFile(index_path.c_str(), "wb", error);
+  if (!index_file) [[unlikely]]
   {
     ERROR_LOG("Failed to open index file '{}' for writing", Path::GetFileName(index_path));
     return false;
   }
 
-  m_blob_file = FileSystem::OpenCFile(blob_path.c_str(), "w+b", error);
-  if (!m_blob_file) [[unlikely]]
+  std::FILE* blob_file = FileSystem::OpenCFile(blob_path.c_str(), "w+b", error);
+  if (!blob_file) [[unlikely]]
   {
     ERROR_LOG("Failed to open blob file '{}' for writing", Path::GetFileName(blob_path));
-    Close();
+    std::fclose(index_file);
     FileSystem::DeleteFile(index_path.c_str());
     return false;
   }
 
-  if (!CreateNew(version, error))
+  if (!CreateNew(data_version, index_file, blob_file, error))
   {
     ERROR_LOG("Failed to create to index file '{}'", Path::GetFileName(index_path));
-    Close();
+    std::fclose(blob_file);
+    std::fclose(index_file);
     FileSystem::DeleteFile(blob_path.c_str());
     FileSystem::DeleteFile(index_path.c_str());
     return false;
@@ -173,224 +217,265 @@ bool ObjectArchive::CreateNew(const std::string& index_path, const std::string& 
   return true;
 }
 
-bool ObjectArchive::CreateNew(u32 version, Error* error)
+bool ObjectArchive::OpenFile(std::FILE* index_file, std::FILE* blob_file, u32 data_version, Error* error)
+{
+  std::unique_lock lock(m_mutex);
+
+  LockedClose();
+
+  if (!ReadExisting(data_version, index_file, blob_file, error))
+  {
+    // Need to consume the file pointers.
+    std::fclose(index_file);
+    std::fclose(blob_file);
+    return false;
+  }
+
+  return true;
+}
+
+bool ObjectArchive::CreateFile(std::FILE* index_file, std::FILE* blob_file, u32 data_version, Error* error)
+{
+  std::unique_lock lock(m_mutex);
+
+  LockedClose();
+
+  if (!CreateNew(data_version, index_file, blob_file, error))
+  {
+    // Need to consume the file pointers.
+    std::fclose(index_file);
+    std::fclose(blob_file);
+    return false;
+  }
+
+  return true;
+}
+
+bool ObjectArchive::CreateNew(u32 version, std::FILE* index_file, std::FILE* blob_file, Error* error)
 {
   CacheFileHeader file_header;
   file_header.signature = EXPECTED_SIGNATURE;
   file_header.cache_version = version;
-  if (std::fwrite(&file_header, sizeof(file_header), 1, m_index_file) != 1) [[unlikely]]
+  if (std::fwrite(&file_header, sizeof(file_header), 1, index_file) != 1) [[unlikely]]
   {
     Error::SetErrno(error, "fwrite() for version failed: ", errno);
     return false;
   }
 
+  m_index_file = index_file;
+  m_blob_file = blob_file;
   return true;
 }
 
-bool ObjectArchive::OpenExisting(const std::string& index_path, const std::string& blob_path, u32 version, Error* error)
-{
-  m_index_file = FileSystem::OpenCFile(index_path.c_str(), "r+b", error);
-  if (!m_index_file)
-  {
-    // special case here: when there's a sharing violation (i.e. two instances running),
-    // we don't want to blow away the cache. so just continue without a cache.
-    if (errno == EACCES)
-    {
-      WARNING_LOG("Failed to open archive index with EACCES, are you running two instances?");
-      return true;
-    }
-
-    return false;
-  }
-
-  m_blob_file = FileSystem::OpenCFile(blob_path.c_str(), "a+b", error);
-  if (!m_blob_file) [[unlikely]]
-  {
-    ERROR_LOG("Blob file '{}' is missing", Path::GetFileName(blob_path));
-    Close();
-    return false;
-  }
-
-  return ReadExisting(version, error);
-}
-
-bool ObjectArchive::ReadExisting(u32 version, Error* error)
+bool ObjectArchive::ReadExisting(u32 version, std::FILE* index_file, std::FILE* blob_file, Error* error)
 {
   CacheFileHeader file_header;
-  if (std::fread(&file_header, sizeof(file_header), 1, m_index_file) != 1 ||
+  if (std::fread(&file_header, sizeof(file_header), 1, index_file) != 1 ||
       file_header.signature != EXPECTED_SIGNATURE || file_header.cache_version != version) [[unlikely]]
   {
     Error::SetStringFmt(error, "Bad file/data version (expected {}, got {})", version, file_header.cache_version);
-    Close();
     return false;
   }
 
-  const s64 index_file_size = FileSystem::FSize64(m_index_file);
+  const s64 index_file_size = FileSystem::FSize64(index_file);
   if (index_file_size < 0 || index_file_size > 1 * 1048576)
   {
     Error::SetStringFmt(error, "Index file is too large ({} bytes)", index_file_size);
-    Close();
     return false;
   }
 
-  const s64 blob_file_size = FileSystem::FSize64(m_blob_file, error);
+  const s64 blob_file_size = FileSystem::FSize64(blob_file, error);
   if (blob_file_size < 0)
-  {
-    Close();
     return false;
-  }
 
-  // preallocate string storage, this will overshoot a bit since we don't know the actual key sizes, but it should be
+  // preallocate key storage, this will overshoot a bit since we don't know the actual key sizes, but it should be
   // good enough to avoid fragmentation and multiple resizes in most cases.
-  m_key_pool.Reserve(static_cast<size_t>(index_file_size));
+  m_key_pool.reserve(static_cast<size_t>(index_file_size));
 
   Timer timer;
-  std::string key;
+  std::vector<u8> key;
   for (;;)
   {
     CacheIndexEntryHeader key_header;
     u32 key_size;
 
-    if (std::fread(&key_header, sizeof(key_header), 1, m_index_file) != 1 ||
-        (key_size = key_header.GetKeySize()) == 0 || key_size > MAX_KEY_SIZE ||
-        (key_header.file_offset + key_header.compressed_size) > blob_file_size ||
+    if (std::fread(&key_header, sizeof(key_header), 1, index_file) != 1 || (key_size = key_header.GetKeySize()) == 0 ||
+        key_size > MAX_KEY_SIZE || (key_header.file_offset + key_header.compressed_size) > blob_file_size ||
         key_header.compress_type >= static_cast<u8>(CompressType::Count) ||
-        (key.resize(key_size), std::fread(key.data(), key_size, 1, m_index_file)) != 1) [[unlikely]]
+        (key.resize(key_size), std::fread(key.data(), key_size, 1, index_file)) != 1) [[unlikely]]
     {
-      if (std::feof(m_index_file))
+      if (std::feof(index_file))
         break;
 
       Error::SetErrno(error, "fread() failed: ", errno);
-      Close();
+      m_index.clear();
+      m_key_pool.clear();
       return false;
     }
 
-    const BumpStringPool::Offset offset = m_key_pool.AddString(key);
-    m_index.emplace_back(key_header.file_offset, key_header.compressed_size, key_header.uncompressed_size,
-                         static_cast<u32>(offset), key_size, static_cast<CompressType>(key_header.compress_type));
+    const u32 offset = static_cast<u32>(m_key_pool.size());
+    m_key_pool.insert(m_key_pool.end(), key.begin(), key.end());
+    m_index.emplace_back(key_header.file_offset, key_header.compressed_size, key_header.uncompressed_size, offset,
+                         key_size, static_cast<CompressType>(key_header.compress_type));
   }
 
   // ensure we don't write before seeking
-  if (!FileSystem::FSeek64(m_index_file, 0, SEEK_END, error))
+  if (!FileSystem::FSeek64(index_file, 0, SEEK_END, error))
   {
-    Close();
+    m_index.clear();
+    m_key_pool.clear();
     return false;
   }
 
   // ensure index is sorted, the file is written out of order so it probably won't be
   std::sort(m_index.begin(), m_index.end(),
-            [this](const CacheIndexData& a, const CacheIndexData& b) { return (GetKeyString(a) < GetKeyString(b)); });
+            [this](const CacheIndexData& a, const CacheIndexData& b) { return KeyLess(GetKeySpan(a), GetKeySpan(b)); });
 
   // there shouldn't be any duplicates
   for (size_t i = 1; i < m_index.size(); i++)
   {
-    if (GetKeyString(m_index[i - 1]) == GetKeyString(m_index[i]))
+    if (KeyEqual(GetKeySpan(m_index[i - 1]), GetKeySpan(m_index[i])))
     {
-      Error::SetStringFmt(error, "Duplicate key '{}' in index file, corrupt file?", GetKeyString(m_index[i]));
-      Close();
+      Error::SetStringView(error, "Duplicate key in index file, corrupt file?");
+      m_index.clear();
+      m_key_pool.clear();
       return false;
     }
   }
 
   DEV_LOG("Read {} entries in {:.2f} ms", m_index.size(), timer.GetTimeMilliseconds());
+  m_blob_file = blob_file;
+  m_index_file = index_file;
   return true;
 }
 
-std::string_view ObjectArchive::GetKeyString(const CacheIndexData& data) const
+ObjectArchive::KeySpan ObjectArchive::GetKeySpan(const CacheIndexData& data) const
 {
-  return m_key_pool.GetString(data.key_offset, data.key_size);
+  return KeySpan(m_key_pool.data() + data.key_offset, data.key_size);
 }
 
-std::optional<ObjectArchive::ObjectData> ObjectArchive::Lookup(std::string_view key, Error* error)
+std::optional<ObjectArchive::ObjectData> ObjectArchive::Lookup(KeySpan key, Error* error)
 {
-  const auto iter = std::lower_bound(
-    m_index.begin(), m_index.end(), key,
-    [this](const CacheIndexData& entry, const std::string_view& key) { return (GetKeyString(entry) < key); });
-  if (iter == m_index.end() || GetKeyString(*iter) != key)
+  std::optional<ObjectArchive::ObjectData> data;
+  CompressType compress_type;
+  u32 uncompressed_size;
   {
-    Error::SetStringView(error, ERROR_DESCRIPTION_DOES_NOT_EXIST);
-    return std::nullopt;
+    // Minimize the time locked, only the lookup+read, not the decompress.
+    std::unique_lock lock(m_mutex);
+    if (!IsOpen()) [[unlikely]]
+    {
+      Error::SetStringView(error, ERROR_DESCRIPTION_NOT_OPEN);
+      return std::nullopt;
+    }
+    const auto iter =
+      std::lower_bound(m_index.begin(), m_index.end(), key,
+                       [this](const CacheIndexData& entry, KeySpan key) { return KeyLess(GetKeySpan(entry), key); });
+    if (iter == m_index.end() || !KeyEqual(GetKeySpan(*iter), key))
+    {
+      Error::SetStringView(error, ERROR_DESCRIPTION_DOES_NOT_EXIST);
+      return std::nullopt;
+    }
+
+    data.emplace(iter->compressed_size);
+    if (std::fseek(m_blob_file, iter->file_offset, SEEK_SET) != 0 ||
+        std::fread(data->data(), iter->compressed_size, 1, m_blob_file) != 1) [[unlikely]]
+    {
+      ERROR_LOG("failed to read {} byte object at offset {}", iter->compressed_size, iter->file_offset);
+      Error::SetErrno(error, errno);
+      return std::nullopt;
+    }
+
+    compress_type = iter->compress_type;
+    uncompressed_size = iter->uncompressed_size;
   }
 
-  ObjectData data(iter->compressed_size);
-  if (std::fseek(m_blob_file, iter->file_offset, SEEK_SET) != 0 ||
-      std::fread(data.data(), iter->compressed_size, 1, m_blob_file) != 1) [[unlikely]]
-  {
-    ERROR_LOG("failed to read {} byte object at offset {} for key '{}'", iter->compressed_size, iter->file_offset, key);
-    Error::SetErrno(error, errno);
-    return std::nullopt;
-  }
-
-  if (iter->compress_type == CompressType::Uncompressed)
-    return std::optional<ObjectData>(std::move(data));
+  if (compress_type == CompressType::Uncompressed)
+    return data;
 
   ObjectData uncompressed_data;
-  if (!CompressHelpers::DecompressBuffer(uncompressed_data, iter->compress_type, data.cspan(), iter->uncompressed_size,
-                                         error))
+  if (!CompressHelpers::DecompressBuffer(uncompressed_data, compress_type, data->cspan(), uncompressed_size, error))
   {
-    ERROR_LOG("Decompress {} byte object failed", iter->uncompressed_size);
+    ERROR_LOG("Decompress {} byte object failed", uncompressed_size);
     return std::nullopt;
   }
 
   return std::optional<ObjectData>(std::move(uncompressed_data));
 }
 
-bool ObjectArchive::Contains(std::string_view key) const
+bool ObjectArchive::Contains(KeySpan key) const
 {
-  if (key.empty() || key.size() > MAX_KEY_SIZE || !IsOpen()) [[unlikely]]
+  if (key.empty() || key.size() > MAX_KEY_SIZE) [[unlikely]]
     return false;
 
-  const auto iter = std::lower_bound(
-    m_index.begin(), m_index.end(), key,
-    [this](const CacheIndexData& entry, const std::string_view& key) { return (GetKeyString(entry) < key); });
-  return (iter != m_index.end() && GetKeyString(*iter) == key);
+  std::unique_lock lock(m_mutex);
+  if (!IsOpen()) [[unlikely]]
+    return false;
+
+  const auto iter =
+    std::lower_bound(m_index.begin(), m_index.end(), key,
+                     [this](const CacheIndexData& entry, KeySpan key) { return KeyLess(GetKeySpan(entry), key); });
+  return (iter != m_index.end() && KeyEqual(GetKeySpan(*iter), key));
 }
 
-bool ObjectArchive::Insert(std::string_view key, std::span<const u8> data, CompressType compression, Error* error)
-{
-  return Insert(key, data.data(), data.size(), compression, error);
-}
-
-bool ObjectArchive::Insert(std::string_view key, const void* data, size_t data_size, CompressType compression,
-                           Error* error)
+bool ObjectArchive::Insert(KeySpan key, std::span<const u8> data, CompressType compression, Error* error)
 {
   if (key.empty() || key.size() > MAX_KEY_SIZE) [[unlikely]]
   {
     Error::SetStringView(error, "Invalid key size.");
     return false;
   }
-  else if (!IsOpen()) [[unlikely]]
-  {
-    Error::SetStringView(error, "Archive is not open.");
-    return false;
-  }
 
-  const auto iter = std::lower_bound(
-    m_index.begin(), m_index.end(), key,
-    [this](const CacheIndexData& entry, const std::string_view& key) { return (GetKeyString(entry) < key); });
-  if (iter != m_index.end() && GetKeyString(*iter) == key)
+  // Lookup once before compress, and again afterwards because we don't hold the lock.
   {
-    Error::SetStringView(error, ERROR_DESCRIPTION_ALREADY_EXISTS);
-    return false;
-  }
-
-  DynamicHeapArray<u8> compress_buffer;
-  const void* write_data = data;
-  size_t write_size = data_size;
-  if (compression != CompressType::Uncompressed)
-  {
-    if (!CompressHelpers::CompressToBuffer(compress_buffer, compression,
-                                           std::span<const u8>(static_cast<const u8*>(data), data_size), -1, error))
+    std::unique_lock lock(m_mutex);
+    if (!IsOpen()) [[unlikely]]
     {
-      ERROR_LOG("Compress {} byte object failed", data_size);
+      Error::SetStringView(error, ERROR_DESCRIPTION_NOT_OPEN);
       return false;
     }
 
-    DEV_LOG("Cached compressed object: {} -> {} bytes ({:.1f}%)", data_size, compress_buffer.size(),
-            (static_cast<float>(data_size) / static_cast<float>(compress_buffer.size())) * 100.0f);
+    if (const auto iter = std::lower_bound(
+          m_index.begin(), m_index.end(), key,
+          [this](const CacheIndexData& entry, KeySpan key) { return KeyLess(GetKeySpan(entry), key); });
+        iter != m_index.end() && KeyEqual(GetKeySpan(*iter), key))
+    {
+      Error::SetStringView(error, ERROR_DESCRIPTION_ALREADY_EXISTS);
+      return false;
+    }
+  }
+
+  DynamicHeapArray<u8> compress_buffer;
+  const void* write_data = data.data();
+  size_t write_size = data.size();
+  if (compression != CompressType::Uncompressed)
+  {
+    if (!CompressHelpers::CompressToBuffer(compress_buffer, compression, data, -1, error))
+    {
+      ERROR_LOG("Compress {} byte object failed", data.size());
+      return false;
+    }
+
+    DEV_LOG("Cached compressed object: {} -> {} bytes ({:.1f}%)", data.size(), compress_buffer.size(),
+            (static_cast<float>(data.size()) / static_cast<float>(compress_buffer.size())) * 100.0f);
 
     write_data = compress_buffer.data();
     write_size = compress_buffer.size();
+  }
+
+  // See above.
+  std::unique_lock lock(m_mutex);
+  if (!IsOpen()) [[unlikely]]
+  {
+    Error::SetStringView(error, ERROR_DESCRIPTION_NOT_OPEN);
+    return false;
+  }
+  const auto iter =
+    std::lower_bound(m_index.begin(), m_index.end(), key,
+                     [this](const CacheIndexData& entry, KeySpan key) { return KeyLess(GetKeySpan(entry), key); });
+  if (iter != m_index.end() && KeyEqual(GetKeySpan(*iter), key))
+  {
+    Error::SetStringView(error, ERROR_DESCRIPTION_ALREADY_EXISTS);
+    return false;
   }
 
   if (!m_blob_file || !FileSystem::FSeek64(m_blob_file, 0, SEEK_END, error))
@@ -406,10 +491,11 @@ bool ObjectArchive::Insert(std::string_view key, const void* data, size_t data_s
   CacheIndexData idata;
   idata.file_offset = static_cast<u32>(file_offset);
   idata.compressed_size = static_cast<u32>(write_size);
-  idata.uncompressed_size = static_cast<u32>(data_size);
-  idata.key_offset = static_cast<u32>(m_key_pool.AddString(key));
+  idata.uncompressed_size = static_cast<u32>(data.size());
+  idata.key_offset = static_cast<u32>(m_key_pool.size());
   idata.key_size = static_cast<u32>(key.size());
   idata.compress_type = compression;
+  m_key_pool.insert(m_key_pool.end(), key.begin(), key.end());
 
   CacheIndexEntryHeader key_header = {};
   key_header.file_offset = idata.file_offset;
@@ -424,7 +510,7 @@ bool ObjectArchive::Insert(std::string_view key, const void* data, size_t data_s
     [[unlikely]]
   {
     Error::SetErrno(error, "fwrite() failed: ", errno);
-    ERROR_LOG("Failed to write {} byte object", data_size);
+    ERROR_LOG("Failed to write {} byte object", data.size());
     return false;
   }
 
@@ -434,6 +520,7 @@ bool ObjectArchive::Insert(std::string_view key, const void* data, size_t data_s
 
 u64 ObjectArchive::GetTotalObjectSize() const
 {
+  std::unique_lock lock(m_mutex);
   u64 total_size = 0;
   for (const CacheIndexData& entry : m_index)
     total_size += entry.uncompressed_size;
@@ -442,6 +529,7 @@ u64 ObjectArchive::GetTotalObjectSize() const
 
 u64 ObjectArchive::GetTotalSize() const
 {
+  std::unique_lock lock(m_mutex);
   u64 total_size = 0;
   for (const CacheIndexData& entry : m_index)
     total_size += entry.compressed_size + sizeof(CacheIndexEntryHeader) + entry.key_size;

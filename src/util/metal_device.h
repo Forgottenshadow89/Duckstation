@@ -276,7 +276,9 @@ public:
   std::unique_ptr<GPUShader> CreateShaderFromSource(GPUShaderStage stage, GPUShaderLanguage language,
                                                     std::string_view source, const char* entry_point,
                                                     DynamicHeapArray<u8>* out_binary, Error* error) override;
+  std::unique_ptr<GPUPipeline> LoadPipeline(const GPUPipeline::GraphicsConfig& config) override;
   std::unique_ptr<GPUPipeline> CreatePipeline(const GPUPipeline::GraphicsConfig& config, Error* error) override;
+  std::unique_ptr<GPUPipeline> LoadPipeline(const GPUPipeline::ComputeConfig& config) override;
   std::unique_ptr<GPUPipeline> CreatePipeline(const GPUPipeline::ComputeConfig& config, Error* error) override;
 
 #ifdef ENABLE_GPU_OBJECT_NAMES
@@ -343,6 +345,8 @@ protected:
                                     GPUVSyncMode vsync_mode, const ExclusiveFullscreenMode* exclusive_fullscreen_mode,
                                     std::optional<bool> exclusive_fullscreen_control, Error* error) override;
   void DestroyDevice() override;
+
+  u16 GetShaderCacheVersion() const override;
 
 private:
   static constexpr u32 UNIFORM_BUFFER_ALIGNMENT = 256;

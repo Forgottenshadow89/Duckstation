@@ -14,6 +14,7 @@
 #include "host.h"
 #include "imgui_overlays.h"
 #include "settings.h"
+#include "shader_cache_version.h"
 #include "system_private.h"
 #include "video_presenter.h"
 #include "video_thread.h"
@@ -210,52 +211,37 @@ namespace {
 class ShaderCompileProgressTracker
 {
 public:
-  ShaderCompileProgressTracker(u32 total)
-    : m_image(System::GetImageForLoadingScreen(VideoThread::GetGamePath())),
-      m_min_time(Timer::ConvertSecondsToValue(1.0)), m_update_interval(Timer::ConvertSecondsToValue(0.1)),
-      m_start_time(Timer::GetCurrentValue()), m_last_update_time(0), m_progress(0), m_total(total)
-  {
-  }
-  ~ShaderCompileProgressTracker() = default;
+  ShaderCompileProgressTracker(u32 total);
+  ~ShaderCompileProgressTracker();
 
-  double GetElapsedMilliseconds() const
-  {
-    return Timer::ConvertValueToMilliseconds(Timer::GetCurrentValue() - m_start_time);
-  }
-
-  bool Increment(u32 progress, Error* error)
-  {
-    m_progress += progress;
-
-    if (System::IsStartupCancelled())
-    {
-      Error::SetStringView(error, TRANSLATE_SV("System", "Startup was cancelled."));
-      ERROR_LOG("Shader compilation aborted due to cancelled startup");
-      return false;
-    }
-
-    const u64 tv = Timer::GetCurrentValue();
-    if ((tv - m_start_time) >= m_min_time && (tv - m_last_update_time) >= m_update_interval)
-    {
-      FullscreenUI::RenderLoadingScreen(
-        m_image, TRANSLATE_SV("GPU_HW", "Compiling Shaders..."),
-        SmallString::from_format(TRANSLATE_FS("GPU_HW", "{} of {} pipelines"), m_progress, m_total), 0,
-        static_cast<int>(m_total), static_cast<int>(m_progress));
-      m_last_update_time = tv;
-    }
-
-    return true;
-  }
+  double GetElapsedMilliseconds() const;
+  bool Increment(u32 progress, Error* error);
+  bool CompileShader(std::unique_ptr<GPUShader>* dest, const GPUShaderCacheKey& key, std::string source, Error* error);
+  bool CompilePipeline(std::unique_ptr<GPUPipeline>* dest, const GPUPipeline::GraphicsConfig& config, Error* error);
+  bool WaitForCompletion(Error* error);
 
 private:
+  bool CheckForCancelledStartup(Error* error);
+  bool ConsumeCompletedTasks(Error* error);
+  void UpdateProgressScreen();
+
   std::string m_image;
   Timer::Value m_min_time;
   Timer::Value m_update_interval;
   Timer::Value m_start_time;
-  Timer::Value m_last_update_time;
-  u32 m_progress;
+  Timer::Value m_last_update_time = 0;
+  u32 m_progress = 0;
   u32 m_total;
+
+  u32 m_last_progress = std::numeric_limits<u32>::max();
+
+  s32 m_tasks_remaining = 0;
+
+  // False sharing on these, meh, whatever.
+  std::atomic_int32_t m_tasks_completed{0};
+  std::atomic_flag m_tasks_abort = ATOMIC_FLAG_INIT;
 };
+
 } // namespace
 
 GPU_HW::GPU_HW() : GPUBackend()
@@ -554,6 +540,8 @@ bool GPU_HW::UpdateSettings(const GPUSettings& old_settings, Error* error)
                                g_gpu_settings.gpu_scaled_interlacing != old_settings.gpu_scaled_interlacing)) ||
      (resolution_scale > 1 && g_gpu_settings.gpu_texture_filter == GPUTextureFilter::Nearest &&
       g_gpu_settings.gpu_force_round_texcoords != old_settings.gpu_force_round_texcoords) ||
+     (resolution_scale > 1 &&
+      g_gpu_settings.gpu_disable_upscaled_direct_textures != old_settings.gpu_disable_upscaled_direct_textures) ||
      g_gpu_settings.gpu_modulation_crop != old_settings.gpu_modulation_crop ||
      g_gpu_settings.IsUsingShaderBlending() != old_settings.IsUsingShaderBlending() ||
      m_texture_filtering != g_gpu_settings.gpu_texture_filter ||
@@ -945,6 +933,8 @@ void GPU_HW::PrintSettingsToLog()
            (m_resolution_scale > 1 && g_gpu_settings.gpu_scaled_interlacing) ? " (scaled)" : "");
   INFO_LOG("Force round texture coordinates: {}",
            (m_resolution_scale > 1 && g_gpu_settings.gpu_force_round_texcoords) ? "Enabled" : "Disabled");
+  INFO_LOG("Disable upscaled direct textures: {}",
+           (m_resolution_scale > 1 && g_gpu_settings.gpu_disable_upscaled_direct_textures) ? "Enabled" : "Disabled");
   INFO_LOG("Texture Filtering: {}/{}", Settings::GetTextureFilterDisplayName(m_texture_filtering),
            Settings::GetTextureFilterDisplayName(m_sprite_texture_filtering));
   INFO_LOG("Dual-source blending: {}", m_supports_dual_source_blend ? "Supported" : "Not supported");
@@ -1115,6 +1105,168 @@ void GPU_HW::DestroyBuffers()
   g_gpu_device->RecycleTexture(std::move(m_vram_readback_texture));
 }
 
+ShaderCompileProgressTracker::ShaderCompileProgressTracker(u32 total)
+  : m_image(System::GetImageForLoadingScreen(VideoThread::GetGamePath())),
+    m_min_time(Timer::ConvertSecondsToValue(1.0)), m_update_interval(Timer::ConvertSecondsToValue(0.1)),
+    m_start_time(Timer::GetCurrentValue()), m_total(total)
+{
+}
+
+ShaderCompileProgressTracker::~ShaderCompileProgressTracker() = default;
+
+double ShaderCompileProgressTracker::GetElapsedMilliseconds() const
+{
+  return Timer::ConvertValueToMilliseconds(Timer::GetCurrentValue() - m_start_time);
+}
+
+bool ShaderCompileProgressTracker::Increment(u32 progress, Error* error)
+{
+  m_progress += progress;
+
+  if (CheckForCancelledStartup(error))
+  {
+    // some shaders may not have been cached, so we need to explicitly wait here
+    WaitForCompletion(nullptr);
+    return false;
+  }
+
+  UpdateProgressScreen();
+  return true;
+}
+
+bool ShaderCompileProgressTracker::CheckForCancelledStartup(Error* error)
+{
+  if (!System::IsStartupCancelled())
+    return false;
+
+  Error::SetStringView(error, TRANSLATE_SV("System", "Startup was cancelled."));
+  ERROR_LOG("Shader compilation aborted due to cancelled startup");
+  m_tasks_abort.test_and_set(std::memory_order_acq_rel);
+  return true;
+}
+
+void ShaderCompileProgressTracker::UpdateProgressScreen()
+{
+  const u64 tv = Timer::GetCurrentValue();
+  if ((tv - m_start_time) >= m_min_time && m_progress != m_last_progress &&
+      (tv - m_last_update_time) >= m_update_interval)
+  {
+    m_last_progress = m_progress;
+    m_last_update_time = tv;
+
+    FullscreenUI::RenderLoadingScreen(
+      m_image, TRANSLATE_SV("GPU_HW", "Compiling Shaders..."),
+      SmallString::from_format(TRANSLATE_FS("GPU_HW", "{} of {} pipelines"), m_progress, m_total), 0,
+      static_cast<int>(m_total), static_cast<int>(m_progress));
+  }
+}
+
+bool ShaderCompileProgressTracker::CompileShader(std::unique_ptr<GPUShader>* dest, const GPUShaderCacheKey& key,
+                                                 std::string source, Error* error)
+{
+  if (!g_gpu_device->GetFeatures().thread_safe_shader_compile)
+  {
+    if (!(*dest = g_gpu_device->CompileShader(key, source, error)))
+      return false;
+
+    return Increment(1, error);
+  }
+
+  m_tasks_remaining++;
+  Host::QueueAsyncTask([this, dest, key, source = std::move(source)]() {
+    // bail out on error
+    if (!m_tasks_abort.test(std::memory_order_acquire))
+    {
+      Error error;
+      if (!(*dest = g_gpu_device->CompileShader(key, source, &error)))
+      {
+        ERROR_LOG("Failed to compile {} shader: {}", GPUShader::GetStageName(key.stage), error.GetDescription());
+        m_tasks_abort.test_and_set(std::memory_order_acq_rel);
+      }
+    }
+
+    m_tasks_completed.fetch_add(1, std::memory_order_acq_rel);
+  });
+
+  return true;
+}
+
+bool ShaderCompileProgressTracker::CompilePipeline(std::unique_ptr<GPUPipeline>* dest,
+                                                   const GPUPipeline::GraphicsConfig& config, Error* error)
+{
+  if (!g_gpu_device->GetFeatures().thread_safe_shader_compile)
+  {
+    if (!(*dest = g_gpu_device->CreatePipeline(config, error)))
+      return false;
+
+    return Increment(1, error);
+  }
+
+  m_tasks_remaining++;
+  Host::QueueAsyncTask([this, dest, config]() {
+    // bail out on error
+    if (!m_tasks_abort.test(std::memory_order_acquire))
+    {
+      Error error;
+      if (!(*dest = g_gpu_device->CreatePipeline(config, &error)))
+      {
+        ERROR_LOG("Failed to create pipeline: {}", error.GetDescription());
+        m_tasks_abort.test_and_set(std::memory_order_acq_rel);
+      }
+    }
+
+    m_tasks_completed.fetch_add(1, std::memory_order_acq_rel);
+  });
+
+  return true;
+}
+
+bool ShaderCompileProgressTracker::WaitForCompletion(Error* error)
+{
+  bool ret = true;
+
+  while (m_tasks_remaining > 0)
+  {
+    // still need to wait for the workers to finish, even on error
+    ret &= ConsumeCompletedTasks(error);
+
+    if (m_tasks_remaining <= 0)
+      break;
+
+    // if we're just waiting for someone else to finish, don't spam updates
+    UpdateProgressScreen();
+    VideoPresenter::ThrottlePresentation();
+  }
+
+  Assert(m_tasks_remaining == 0);
+  return ret;
+}
+
+bool ShaderCompileProgressTracker::ConsumeCompletedTasks(Error* error)
+{
+  const s32 done = m_tasks_completed.load(std::memory_order_acquire);
+  if (done == 0)
+    return true;
+
+  m_tasks_completed.fetch_sub(done, std::memory_order_acq_rel);
+  m_tasks_remaining -= done;
+  m_progress += done;
+
+  if (m_tasks_abort.test(std::memory_order_acquire)) [[unlikely]]
+  {
+    Error::SetStringView(error, "One or more shaders failed to compile.");
+    return false;
+  }
+  else if (CheckForCancelledStartup(error)) [[unlikely]]
+  {
+    // this is called from WaitForCompletion(), which will drain
+    return false;
+  }
+
+  UpdateProgressScreen();
+  return true;
+}
+
 bool GPU_HW::CompileCommonShaders(Error* error)
 {
   const GPU_HW_ShaderGen shadergen(g_gpu_device->GetRenderAPI(), m_supports_dual_source_blend,
@@ -1146,6 +1298,7 @@ bool GPU_HW::CompilePipelines(Error* error)
   const bool per_sample_shading = (msaa && g_gpu_settings.gpu_per_sample_shading && features.per_sample_shading);
   const bool force_round_texcoords =
     (upscaled && m_texture_filtering == GPUTextureFilter::Nearest && g_gpu_settings.gpu_force_round_texcoords);
+  const bool disable_upscaled_direct_textures = (upscaled && g_gpu_settings.gpu_disable_upscaled_direct_textures);
   const bool modulation_crop = g_gpu_settings.gpu_modulation_crop;
   const bool true_color = g_gpu_settings.IsUsingTrueColor();
   const bool scaled_dithering = (!m_true_color && upscaled && g_gpu_settings.IsUsingScaledDithering());
@@ -1243,8 +1396,17 @@ bool GPU_HW::CompilePipelines(Error* error)
     batch_fragment_shaders.enumerate(destroy_shader);
   });
 
+  GPU_HW_ShaderGen::BatchVertexShaderSelector vssel = {};
+  vssel.upscaled = upscaled;
+  vssel.msaa = msaa;
+  vssel.per_sample_shading = per_sample_shading;
+  vssel.pgxp_depth = m_pgxp_depth_buffer;
+  vssel.disable_color_perspective = disable_color_perspective;
+  vssel.disable_upscaled_direct_textures = disable_upscaled_direct_textures;
   for (u8 textured = 0; textured < 2; textured++)
   {
+    vssel.textured = (textured != 0);
+
     for (u8 palette = 0; palette < 3; palette++)
     {
       if (palette && !textured)
@@ -1252,26 +1414,46 @@ bool GPU_HW::CompilePipelines(Error* error)
       if (palette == 2 && !needs_page_texture)
         continue;
 
+      vssel.palette = (palette == 1);
+      vssel.page_texture = (palette == 2);
+
       for (u8 sprite = 0; sprite < 2; sprite++)
       {
         if (sprite && (!textured || !m_allow_sprite_mode))
           continue;
 
-        const bool uv_limits = ShouldClampUVs(sprite ? m_sprite_texture_filtering : m_texture_filtering);
-        const std::string vs = shadergen.GenerateBatchVertexShader(
-          upscaled, msaa, per_sample_shading, textured != 0, palette == 1, palette == 2, uv_limits,
-          !sprite && force_round_texcoords, m_pgxp_depth_buffer, disable_color_perspective);
-        if (!(batch_vertex_shaders[textured][palette][sprite] =
-                g_gpu_device->CreateShader(GPUShaderStage::Vertex, shadergen.GetLanguage(), vs, error)))
-        {
-          return false;
-        }
+        vssel.uv_limits = ShouldClampUVs(sprite ? m_sprite_texture_filtering : m_texture_filtering);
+        vssel.force_round_texcoords = !sprite && force_round_texcoords;
 
-        if (!progress.Increment(1, error)) [[unlikely]]
-          return false;
+        const GPUShaderCacheKey key =
+          GPUDevice::GetShaderCacheKey(GPUShaderStage::Vertex, shadergen.GetLanguage(),
+                                       static_cast<u16>(ShaderCacheKeyType::HWBatchVertex), &vssel, sizeof(vssel));
+        if (!(batch_vertex_shaders[textured][palette][sprite] = g_gpu_device->LoadShader(key)))
+        {
+          if (!progress.CompileShader(&batch_vertex_shaders[textured][palette][sprite], key,
+                                      shadergen.GenerateBatchVertexShader(vssel), error)) [[unlikely]]
+          {
+            return false;
+          }
+        }
+        else
+        {
+          if (!progress.Increment(1, error)) [[unlikely]]
+            return false;
+        }
       }
     }
   }
+
+  GPU_HW_ShaderGen::BatchFragmentShaderSelector fssel = {};
+  fssel.upscaled = upscaled;
+  fssel.msaa = msaa;
+  fssel.per_sample_shading = per_sample_shading;
+  fssel.modulation_crop = modulation_crop;
+  fssel.true_color = true_color;
+  fssel.disable_color_perspective = disable_color_perspective;
+  fssel.write_mask_as_depth = m_write_mask_as_depth;
+  fssel.disable_upscaled_direct_textures = disable_upscaled_direct_textures;
 
   for (u8 depth_test = 0; depth_test < 2; depth_test++)
   {
@@ -1283,6 +1465,16 @@ bool GPU_HW::CompilePipelines(Error* error)
 
     for (u8 render_mode = 0; render_mode < 5; render_mode++)
     {
+      fssel.render_mode = static_cast<BatchRenderMode>(render_mode);
+
+      // Compat filtering only applies to opaque passes; semitransparent passes (dithered
+      // shadow/glow layers) keep the stock filter behavior, which renders them softly.
+      const bool compat_filter =
+        g_gpu_settings.gpu_sprite_nearest_coverage && (fssel.render_mode == BatchRenderMode::TransparencyDisabled ||
+                                                       fssel.render_mode == BatchRenderMode::OnlyOpaque);
+      fssel.filter_nearest_coverage = compat_filter;
+      fssel.filter_chroma_key = compat_filter;
+
       for (u8 transparency_mode = 0; transparency_mode < 5; transparency_mode++)
       {
         if (
@@ -1307,6 +1499,12 @@ bool GPU_HW::CompilePipelines(Error* error)
           continue;
         }
 
+        fssel.transparency = static_cast<GPUTransparencyMode>(transparency_mode);
+        fssel.use_rov = (fssel.render_mode == BatchRenderMode::ShaderBlend && m_use_rov_for_shader_blend);
+        fssel.use_rov_depth = (fssel.use_rov && needs_rov_depth);
+        fssel.rov_depth_test = (fssel.use_rov && depth_test != 0);
+        fssel.rov_depth_write = (fssel.rov_depth_test && fssel.transparency == GPUTransparencyMode::Disabled);
+
         for (u8 texture_mode = 0; texture_mode < max_active_texture_modes; texture_mode++)
         {
           if (!needs_page_texture && (texture_mode == static_cast<u8>(BatchTextureMode::PageTexture) ||
@@ -1314,6 +1512,15 @@ bool GPU_HW::CompilePipelines(Error* error)
           {
             continue;
           }
+
+          const bool sprite = (static_cast<BatchTextureMode>(texture_mode) >= BatchTextureMode::SpriteStart);
+          fssel.uv_limits = ShouldClampUVs(sprite ? m_sprite_texture_filtering : m_texture_filtering);
+          fssel.force_round_texcoords = !sprite && force_round_texcoords;
+          fssel.texture_mode =
+            static_cast<BatchTextureMode>(texture_mode - (sprite ? static_cast<u8>(BatchTextureMode::SpriteStart) : 0));
+          fssel.texture_filtering = sprite ? m_sprite_texture_filtering : m_texture_filtering;
+          fssel.is_blended_texture_filtering =
+            (fssel.texture_mode != BatchTextureMode::Disabled && IsBlendedTextureFiltering(fssel.texture_filtering));
 
           for (u8 check_mask = 0; check_mask < 2; check_mask++)
           {
@@ -1329,11 +1536,16 @@ bool GPU_HW::CompilePipelines(Error* error)
               continue;
             }
 
+            fssel.check_mask = ConvertToBoolUnchecked(check_mask);
+
             for (u8 dithering = 0; dithering < 2; dithering++)
             {
               // Never going to draw with dithering on in true color.
               if (dithering && true_color)
                 continue;
+
+              fssel.dithering = ConvertToBoolUnchecked(dithering);
+              fssel.scaled_dithering = (fssel.dithering && scaled_dithering);
 
               for (u8 interlacing = 0; interlacing < 2; interlacing++)
               {
@@ -1341,41 +1553,28 @@ bool GPU_HW::CompilePipelines(Error* error)
                 if (interlacing && force_progressive_scan)
                   continue;
 
-                const bool sprite = (static_cast<BatchTextureMode>(texture_mode) >= BatchTextureMode::SpriteStart);
-                const bool uv_limits = ShouldClampUVs(sprite ? m_sprite_texture_filtering : m_texture_filtering);
-                const BatchTextureMode shader_texmode = static_cast<BatchTextureMode>(
-                  texture_mode - (sprite ? static_cast<u8>(BatchTextureMode::SpriteStart) : 0));
-                const GPUTextureFilter texture_filter = sprite ? m_sprite_texture_filtering : m_texture_filtering;
-                const bool texture_filter_is_blended =
-                  (shader_texmode != BatchTextureMode::Disabled && IsBlendedTextureFiltering(texture_filter));
-                const bool use_rov =
-                  (render_mode == static_cast<u8>(BatchRenderMode::ShaderBlend) && m_use_rov_for_shader_blend);
-                const bool rov_depth_test = (use_rov && depth_test != 0);
-                const bool rov_depth_write = (rov_depth_test && static_cast<GPUTransparencyMode>(transparency_mode) ==
-                                                                  GPUTransparencyMode::Disabled);
-                // Compat filtering only applies to opaque passes; semitransparent passes (dithered
-                // shadow/glow layers) keep the stock filter behavior, which renders them softly.
-                const bool compat_filter =
-                  g_gpu_settings.gpu_sprite_nearest_coverage &&
-                  (static_cast<BatchRenderMode>(render_mode) == BatchRenderMode::TransparencyDisabled ||
-                   static_cast<BatchRenderMode>(render_mode) == BatchRenderMode::OnlyOpaque);
-                const std::string fs = shadergen.GenerateBatchFragmentShader(
-                  static_cast<BatchRenderMode>(render_mode), static_cast<GPUTransparencyMode>(transparency_mode),
-                  shader_texmode, texture_filter, texture_filter_is_blended, compat_filter, compat_filter, upscaled,
-                  msaa, per_sample_shading, uv_limits, !sprite && force_round_texcoords, modulation_crop, true_color,
-                  ConvertToBoolUnchecked(dithering), scaled_dithering, disable_color_perspective,
-                  ConvertToBoolUnchecked(interlacing), scaled_interlacing, ConvertToBoolUnchecked(check_mask),
-                  m_write_mask_as_depth, use_rov, needs_rov_depth, rov_depth_test, rov_depth_write);
+                fssel.interlacing = ConvertToBoolUnchecked(interlacing);
+                fssel.scaled_interlacing = (fssel.interlacing && scaled_interlacing);
+
+                const GPUShaderCacheKey key = GPUDevice::GetShaderCacheKey(
+                  GPUShaderStage::Fragment, shadergen.GetLanguage(),
+                  static_cast<u16>(ShaderCacheKeyType::HWBatchFragment), &fssel, sizeof(fssel));
 
                 if (!(batch_fragment_shaders[depth_test][render_mode][transparency_mode][texture_mode][check_mask]
-                                            [dithering][interlacing] = g_gpu_device->CreateShader(
-                                              GPUShaderStage::Fragment, shadergen.GetLanguage(), fs, error)))
+                                            [dithering][interlacing] = g_gpu_device->LoadShader(key)))
                 {
-                  return false;
+                  if (!progress.CompileShader(&batch_fragment_shaders[depth_test][render_mode][transparency_mode]
+                                                                     [texture_mode][check_mask][dithering][interlacing],
+                                              key, shadergen.GenerateBatchFragmentShader(fssel), error)) [[unlikely]]
+                  {
+                    return false;
+                  }
                 }
-
-                if (!progress.Increment(1, error)) [[unlikely]]
-                  return false;
+                else
+                {
+                  if (!progress.Increment(1, error)) [[unlikely]]
+                    return false;
+                }
               }
             }
           }
@@ -1383,6 +1582,9 @@ bool GPU_HW::CompilePipelines(Error* error)
       }
     }
   }
+
+  if (!progress.WaitForCompletion(error))
+    return false;
 
   static constexpr GPUPipeline::VertexAttribute vertex_attributes[] = {
     GPUPipeline::VertexAttribute::Make(0, GPUPipeline::VertexAttribute::Semantic::Position, 0,
@@ -1584,13 +1786,20 @@ bool GPU_HW::CompilePipelines(Error* error)
                 }
 
                 if (!(m_batch_pipelines[depth_test][transparency_mode][render_mode][texture_mode][dithering]
-                                       [interlacing][check_mask] = g_gpu_device->CreatePipeline(plconfig, error)))
+                                       [interlacing][check_mask] = g_gpu_device->LoadPipeline(plconfig)))
                 {
-                  return false;
+                  if (!progress.CompilePipeline(&m_batch_pipelines[depth_test][transparency_mode][render_mode]
+                                                                  [texture_mode][dithering][interlacing][check_mask],
+                                                plconfig, error))
+                  {
+                    return false;
+                  }
                 }
-
-                if (!progress.Increment(1, error)) [[unlikely]]
-                  return false;
+                else
+                {
+                  if (!progress.Increment(1, error)) [[unlikely]]
+                    return false;
+                }
               }
             }
           }
@@ -1598,6 +1807,9 @@ bool GPU_HW::CompilePipelines(Error* error)
       }
     }
   }
+
+  if (!progress.WaitForCompletion(error))
+    return false;
 
   plconfig.SetTargetFormats(VRAM_RT_FORMAT, needs_rov_depth ? GPUTextureFormat::Unknown : depth_buffer_format);
   plconfig.render_pass_flags = needs_feedback_loop ? GPUPipeline::ColorFeedbackLoop : GPUPipeline::NoRenderPassFlags;

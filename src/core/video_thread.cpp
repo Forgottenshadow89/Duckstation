@@ -44,6 +44,7 @@ namespace VideoThread {
 enum : u32
 {
   COMMAND_QUEUE_SIZE = 16 * 1024 * 1024,
+  COMMAND_QUEUE_RESERVED_SPACE = VideoThreadCommand::AlignCommandSize(1),
   THRESHOLD_TO_WAKE_GPU = 65536,
 };
 
@@ -77,7 +78,7 @@ static void VideoThreadEntryPoint();
 static bool CreateDeviceOnThread(RenderAPI api, bool fullscreen, bool start_fullscreen_ui,
                                  bool preserve_imgui_on_failure, Error* error);
 static void DestroyDeviceOnThread(bool preserve_imgui_state);
-static void ResizeRenderWindowOnThread(u32 width, u32 height, float scale, float refresh_rate);
+static void ResizeRenderWindowOnThread(u32 width, u32 height, float scale, float refresh_rate, bool fullscreen);
 static void RecreateRenderWindowOnThread(bool fullscreen, bool allow_exclusive_fullscreen);
 static void RenderWindowResizedOnThread();
 static bool CheckExclusiveFullscreenOnThread();
@@ -147,7 +148,7 @@ void VideoThread::ResetCommandFIFO()
   s_state.command_fifo_read_ptr.store(0, std::memory_order_release);
 }
 
-void VideoThread::ProcessStartup()
+bool VideoThread::ProcessStartup(Error* error)
 {
   s_state.thread_spin_time = Timer::ConvertNanosecondsToValue(THREAD_SPIN_TIME_US * 1000.0);
   s_state.command_fifo_data = Common::make_unique_aligned_for_overwrite<u8[]>(HOST_CACHE_LINE_SIZE, COMMAND_QUEUE_SIZE);
@@ -155,7 +156,13 @@ void VideoThread::ProcessStartup()
   s_state.run_idle_reasons = static_cast<u8>(RunIdleReason::NoGPUBackend);
 
   // Thread is always started/persists regardless of whether it is used or not.
-  s_state.thread.Start(&VideoThread::VideoThreadEntryPoint);
+  if (!s_state.thread.Start(&VideoThread::VideoThreadEntryPoint)) [[unlikely]]
+  {
+    Error::SetStringView(error, "Failed to start video thread.");
+    return false;
+  }
+
+  return true;
 }
 
 void VideoThread::ProcessShutdown()
@@ -173,7 +180,10 @@ void VideoThread::ProcessShutdown()
 
 VideoThreadCommand* VideoThread::AllocateCommand(VideoThreadCommandType command, u32 size)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   size = VideoThreadCommand::AlignCommandSize(size);
+  DebugAssert(size > 0 && size <= (COMMAND_QUEUE_SIZE - COMMAND_QUEUE_RESERVED_SPACE));
 
   for (;;)
   {
@@ -182,7 +192,7 @@ VideoThreadCommand* VideoThread::AllocateCommand(VideoThreadCommandType command,
     if (read_ptr > write_ptr) [[unlikely]]
     {
       u32 available_size = read_ptr - write_ptr;
-      while (available_size < size)
+      while (available_size <= size)
       {
         WakeThreadIfSleeping();
         read_ptr = s_state.command_fifo_read_ptr.load(std::memory_order_acquire);
@@ -192,7 +202,7 @@ VideoThreadCommand* VideoThread::AllocateCommand(VideoThreadCommandType command,
     else
     {
       const u32 available_size = COMMAND_QUEUE_SIZE - write_ptr;
-      if (size > available_size) [[unlikely]]
+      if (size >= available_size) [[unlikely]]
       {
         // Can't wrap around until the video thread has at least started processing commands...
         if (read_ptr == 0) [[unlikely]]
@@ -258,6 +268,8 @@ bool VideoThread::IsCommandFIFOEmpty()
 
 void VideoThread::PushCommand(VideoThreadCommand* cmd)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   if (!s_state.use_thread) [[unlikely]]
   {
     DebugAssert(s_state.gpu_backend);
@@ -274,6 +286,8 @@ void VideoThread::PushCommand(VideoThreadCommand* cmd)
 
 void VideoThread::PushCommandAndWakeThread(VideoThreadCommand* cmd)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   if (!s_state.use_thread) [[unlikely]]
   {
     DebugAssert(s_state.gpu_backend);
@@ -289,6 +303,8 @@ void VideoThread::PushCommandAndWakeThread(VideoThreadCommand* cmd)
 
 void VideoThread::PushCommandAndSync(VideoThreadCommand* cmd, bool spin)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   if (!s_state.use_thread) [[unlikely]]
   {
     DebugAssert(s_state.gpu_backend);
@@ -329,6 +345,8 @@ ALWAYS_INLINE_RELEASE void VideoThread::WakeThreadIfSleeping()
 
 void VideoThread::SyncThread(bool spin)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   if (!s_state.use_thread)
     return;
 
@@ -568,7 +586,10 @@ bool VideoThread::Reconfigure(std::optional<GPURenderer> renderer, bool upload_v
   cmd->settings = g_settings;
 
   if (!s_state.use_thread) [[unlikely]]
+  {
     ReconfigureOnThread(cmd);
+    cmd->~VideoThreadReconfigureCommand();
+  }
   else
     PushCommandAndSync(cmd, false);
 
@@ -869,6 +890,8 @@ bool VideoThread::CreateGPUBackendOnThread(bool hardware_renderer, bool upload_v
       s_state.gpu_backend = GPUBackend::CreateSoftwareBackend();
       if (!s_state.gpu_backend->Initialize(upload_vram, &local_error))
         Panic("Failed to initialize fallback software renderer");
+
+      okay = true;
     }
 
     if (!okay)
@@ -1111,8 +1134,9 @@ void VideoThread::SetThreadEnabled(bool enabled)
   if (!Reconfigure(requested_renderer, requested_renderer.has_value(), fullscreen_state, requested_fullscreen_ui, true,
                    &error))
   {
-    ERROR_LOG("Reconfigure failed: {}", error.GetDescription());
-    ReportFatalErrorAndShutdown(fmt::format("Reconfigure failed: {}", error.GetDescription()));
+    std::string message = fmt::format("Reconfigure failed: {}", error.GetDescription());
+    ERROR_LOG(message);
+    RunOnThreadAndSync([message = std::move(message)]() { ReportFatalErrorAndShutdown(message); });
   }
 }
 
@@ -1153,7 +1177,7 @@ void VideoThread::UpdateSettingsOnThread(GPUSettings&& new_settings)
 
 void VideoThread::RunOnThread(AsyncCallType func)
 {
-  DebugAssert(!s_state.use_thread || !IsOnThread());
+  DebugAssert(Host::IsOnCoreThread());
 
   if (!s_state.use_thread) [[unlikely]]
   {
@@ -1168,7 +1192,7 @@ void VideoThread::RunOnThread(AsyncCallType func)
 
 void VideoThread::RunOnThreadAndSync(AsyncCallType func)
 {
-  DebugAssert(!s_state.use_thread || !IsOnThread());
+  DebugAssert(Host::IsOnCoreThread());
 
   if (!s_state.use_thread) [[unlikely]]
   {
@@ -1183,7 +1207,7 @@ void VideoThread::RunOnThreadAndSync(AsyncCallType func)
 
 std::pair<VideoThreadCommand*, void*> VideoThread::BeginASyncBufferCall(AsyncBufferCallType func, u32 buffer_size)
 {
-  DebugAssert(!s_state.use_thread || !IsOnThread());
+  DebugAssert(Host::IsOnCoreThread());
 
   // this is less than optimal, but it's only used for input osd updates currently, so whatever
   VideoThreadAsyncBufferCallCommand* const cmd = AllocateCommand<VideoThreadAsyncBufferCallCommand>(
@@ -1194,7 +1218,7 @@ std::pair<VideoThreadCommand*, void*> VideoThread::BeginASyncBufferCall(AsyncBuf
 
 void VideoThread::EndASyncBufferCall(VideoThreadCommand* cmd)
 {
-  DebugAssert(!s_state.use_thread || !IsOnThread());
+  DebugAssert(Host::IsOnCoreThread());
 
   if (!s_state.use_thread) [[unlikely]]
   {
@@ -1358,6 +1382,8 @@ bool VideoThread::IsUsingThread()
 
 void VideoThread::ResizeRenderWindow(s32 width, s32 height, float scale, float refresh_rate)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   const u16 clamped_width = static_cast<u16>(std::clamp<s32>(width, 1, std::numeric_limits<u16>::max()));
   const u16 clamped_height = static_cast<u16>(std::clamp<s32>(height, 1, std::numeric_limits<u16>::max()));
   const bool size_changed = (s_state.render_window_info.surface_width != clamped_width ||
@@ -1369,8 +1395,8 @@ void VideoThread::ResizeRenderWindow(s32 width, s32 height, float scale, float r
   s_state.render_window_info.surface_scale = scale;
   s_state.render_window_info.surface_refresh_rate = refresh_rate;
 
-  RunOnThread([clamped_width, clamped_height, scale, refresh_rate]() {
-    ResizeRenderWindowOnThread(clamped_width, clamped_height, scale, refresh_rate);
+  RunOnThread([clamped_width, clamped_height, scale, refresh_rate, fullscreen = s_state.fullscreen_state]() {
+    ResizeRenderWindowOnThread(clamped_width, clamped_height, scale, refresh_rate, fullscreen);
   });
 
   if (System::IsValid())
@@ -1382,7 +1408,7 @@ void VideoThread::ResizeRenderWindow(s32 width, s32 height, float scale, float r
   }
 }
 
-void VideoThread::ResizeRenderWindowOnThread(u32 width, u32 height, float scale, float refresh_rate)
+void VideoThread::ResizeRenderWindowOnThread(u32 width, u32 height, float scale, float refresh_rate, bool fullscreen)
 {
   // We should _not_ be getting this without a device, since we should have shut down.
   if (!g_gpu_device || !g_gpu_device->HasMainSwapChain())
@@ -1394,9 +1420,8 @@ void VideoThread::ResizeRenderWindowOnThread(u32 width, u32 height, float scale,
   GPUSwapChain* const swap_chain = g_gpu_device->GetMainSwapChain();
   if (!swap_chain->ResizeBuffers(width, height, &error))
   {
-    // ick, CPU thread read, but this is unlikely to happen in the first place
     ERROR_LOG("Failed to resize main swap chain: {}", error.GetDescription());
-    RecreateRenderWindowOnThread(s_state.fullscreen_state, true);
+    RecreateRenderWindowOnThread(fullscreen, true);
     return;
   }
 
@@ -1408,11 +1433,15 @@ void VideoThread::ResizeRenderWindowOnThread(u32 width, u32 height, float scale,
 
 void VideoThread::RecreateRenderWindow()
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   RunOnThread([fullscreen = s_state.fullscreen_state]() { RecreateRenderWindowOnThread(fullscreen, true); });
 }
 
 void VideoThread::SetFullscreen(bool fullscreen)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   // Technically not safe to read g_gpu_device here on the CPU thread, but we do sync on create/destroy.
   if (s_state.fullscreen_state == fullscreen || !Host::CanChangeFullscreenMode(fullscreen) || !g_gpu_device)
     return;
@@ -1423,6 +1452,8 @@ void VideoThread::SetFullscreen(bool fullscreen)
 
 void VideoThread::SetFullscreenWithCompletionHandler(bool fullscreen, AsyncCallType completion_handler)
 {
+  DebugAssert(Host::IsOnCoreThread());
+
   if (s_state.fullscreen_state == fullscreen || !Host::CanChangeFullscreenMode(fullscreen) || !g_gpu_device)
   {
     if (completion_handler)
@@ -1454,10 +1485,10 @@ void VideoThread::RecreateRenderWindowOnThread(bool fullscreen, bool allow_exclu
     exclusive_fullscreen_requested = fullscreen_mode.has_value();
   }
   std::optional<bool> exclusive_fullscreen_control;
-  if (g_settings.display_exclusive_fullscreen_control != DisplayExclusiveFullscreenControl::Automatic)
+  if (g_gpu_settings.display_exclusive_fullscreen_control != DisplayExclusiveFullscreenControl::Automatic)
   {
     exclusive_fullscreen_control =
-      (g_settings.display_exclusive_fullscreen_control == DisplayExclusiveFullscreenControl::Allowed);
+      (g_gpu_settings.display_exclusive_fullscreen_control == DisplayExclusiveFullscreenControl::Allowed);
   }
 
   g_gpu_device->DestroyMainSwapChain();

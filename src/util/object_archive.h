@@ -6,11 +6,13 @@
 #include "compress_helpers.h"
 
 #include "common/heap_array.h"
-#include "common/string_pool.h"
 
+#include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 class Error;
 
@@ -19,24 +21,28 @@ class ObjectArchive
 public:
   using ObjectData = DynamicHeapArray<u8>;
   using CompressType = CompressHelpers::CompressType;
+  using KeySpan = std::span<const u8>;
 
   ObjectArchive();
   ~ObjectArchive();
 
   /// Error messages indicating the key does/does not exist in the archive.
+  static const std::string_view ERROR_DESCRIPTION_NOT_OPEN;
   static const std::string_view ERROR_DESCRIPTION_DOES_NOT_EXIST;
   static const std::string_view ERROR_DESCRIPTION_ALREADY_EXISTS;
 
   /// Returns true if the archive has been successfully opened or created.
+  /// NOTE: Not synchronized, because we should only be opening the archive on one thread.
   bool IsOpen() const { return (m_index_file != nullptr); }
 
   /// Returns the number of entries currently stored in the archive.
-  size_t GetSize() const { return m_index.size(); }
+  size_t GetSize() const;
 
   /// Opens or creates an archive at the given base path. The index and blob files will be named
   /// "{base_path}.idx" and "{base_path}.bin" respectively. If the files already exist and match
-  /// the given data version, they are opened; otherwise a new archive is created.
-  bool OpenPath(std::string_view base_path, u32 data_version, Error* error);
+  /// the given data version, they are opened; otherwise a new archive is created. If was_invalidated
+  /// is provided, it is set when an existing archive is replaced.
+  bool OpenPath(std::string_view base_path, u32 data_version, Error* error, bool* was_invalidated = nullptr);
 
   /// Opens an existing cache file. Ownership of the index_file and blob_file pointers are transferred to the
   /// ObjectArchive and they will be closed when the ObjectArchive is closed or goes out of scope.
@@ -53,18 +59,17 @@ public:
   /// Closes the archive, releasing the index and blob file handles and clearing the in-memory index.
   void Close();
 
-  /// Looks up an object by key. Returns the decompressed object data on success, or std::nullopt
-  /// if the key is not found or an I/O error occurs.
-  std::optional<ObjectData> Lookup(std::string_view key, Error* error);
+  /// Looks up an object by key. String keys are treated as their exact byte sequence, including embedded nulls.
+  /// Returns the decompressed object data on success, or std::nullopt if the key is not found or an I/O error occurs.
+  std::optional<ObjectData> Lookup(KeySpan key, Error* error);
 
   /// Returns true if the specified key exists in the archive.
-  bool Contains(std::string_view key) const;
+  bool Contains(KeySpan key) const;
 
   /// Inserts an object into the archive under the given key. The data may optionally be compressed
   /// using the specified compression type. Returns false if the key already exists, the archive is
   /// not open, or an I/O error occurs.
-  bool Insert(std::string_view key, std::span<const u8> data, CompressType compression, Error* error);
-  bool Insert(std::string_view key, const void* data, size_t data_size, CompressType compression, Error* error);
+  bool Insert(KeySpan key, std::span<const u8> data, CompressType compression, Error* error);
 
   /// Returns the total size of all objects in the cache.
   u64 GetTotalObjectSize() const;
@@ -84,16 +89,17 @@ private:
   };
   using CacheIndex = std::vector<CacheIndexData>;
 
-  bool CreateNew(const std::string& index_path, const std::string& blob_path, u32 version, Error* error);
-  bool CreateNew(u32 version, Error* error);
-  bool OpenExisting(const std::string& index_path, const std::string& blob_path, u32 version, Error* error);
-  bool ReadExisting(u32 version, Error* error);
+  bool CreateNew(u32 version, std::FILE* index_file, std::FILE* blob_file, Error* error);
+  bool ReadExisting(u32 version, std::FILE* index_file, std::FILE* blob_file, Error* error);
+  void LockedClose();
 
-  std::string_view GetKeyString(const CacheIndexData& data) const;
+  KeySpan GetKeySpan(const CacheIndexData& data) const;
 
   CacheIndex m_index;
-  BumpStringPool m_key_pool;
+  std::vector<u8> m_key_pool;
 
   std::FILE* m_index_file = nullptr;
   std::FILE* m_blob_file = nullptr;
+
+  mutable std::mutex m_mutex;
 };

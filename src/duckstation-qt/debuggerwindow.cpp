@@ -8,6 +8,7 @@
 #include "qtutils.h"
 
 #include "core/bus.h"
+#include "core/core.h"
 #include "core/cpu_code_cache.h"
 #include "core/cpu_core_private.h"
 #include "core/cpu_disasm.h"
@@ -23,6 +24,7 @@
 #include "common/string_util.h"
 
 #include "util/ini_settings_interface.h"
+#include "util/translation.h"
 
 #include <fmt/format.h>
 
@@ -44,12 +46,15 @@ LOG_CHANNEL(Host);
 
 static constexpr int TIMER_REFRESH_INTERVAL_MS = 100;
 static constexpr const char* BREAKPOINTS_SECTION = "Breakpoints";
+static constexpr const char* WINDOW_STATE_SECTION = "UI";
+static constexpr const char* WINDOW_STATE_KEY = "DebuggerWindowState";
 
 DebuggerWindow::DebuggerWindow(QWidget* parent /* = nullptr */)
   : QMainWindow(parent), m_active_memory_region(Bus::MemoryRegion::Count)
 {
   m_ui.setupUi(this);
   setupAdditionalUi();
+  restoreWindowState();
   connectSignals();
   createModels();
   setMemoryViewRegion(Bus::MemoryRegion::RAM);
@@ -64,7 +69,9 @@ DebuggerWindow::DebuggerWindow(QWidget* parent /* = nullptr */)
       onSystemStarted();
   }
   else
+  {
     onSystemDestroyed();
+  }
 }
 
 DebuggerWindow::~DebuggerWindow() = default;
@@ -340,7 +347,11 @@ void DebuggerWindow::onCodeViewCommentActivated(VirtualMemoryAddress address)
 void DebuggerWindow::onCodeViewContextMenuRequested(const QPoint& pt)
 {
   const VirtualMemoryAddress address = m_ui.codeView->getAddressAtPoint(pt);
-  m_ui.codeView->setSelectedAddress(address);
+  if (!m_ui.codeView->isAddressSelected(address))
+    m_ui.codeView->setSelectedAddress(address);
+
+  const auto [selection_start, selection_end] = m_ui.codeView->getSelectedAddressRange().value();
+  const u32 selection_count = ((selection_end - selection_start) / CPU::INSTRUCTION_SIZE) + 1;
 
   QMenu* const menu = QtUtils::NewPopupMenu(this);
   menu->addAction(QStringLiteral("0x%1").arg(static_cast<uint>(address), 8, 16, QChar('0')))->setEnabled(false);
@@ -364,11 +375,17 @@ void DebuggerWindow::onCodeViewContextMenuRequested(const QPoint& pt)
                     [this, address]() { startPatchInstruction(address); });
   patch_action->setEnabled(can_patch);
 
-  QAction* const nop_action = menu->addAction(QIcon(u":/icons/monochrome/svg/trash-fill.svg"_s), tr("&Nop Instruction"),
-                                              [this, address]() { patchInstruction(address, 0); });
+  QAction* const nop_action =
+    menu->addAction(QIcon(u":/icons/monochrome/svg/trash-fill.svg"_s),
+                    tr("&Nop %n Instruction(s)", nullptr, static_cast<int>(selection_count)),
+                    [this, selection_start, selection_end]() { patchInstructions(selection_start, selection_end, 0); });
   nop_action->setEnabled(can_patch);
 
   menu->addSeparator();
+  menu->addAction(QIcon(u":/icons/monochrome/svg/file-copy-line.svg"_s),
+                  tr("&Copy %n Instruction(s)", nullptr, static_cast<int>(selection_count)), this,
+                  &DebuggerWindow::copySelectedCodeToClipboard);
+
   menu->addAction(QIcon(u":/icons/monochrome/svg/debugger-go-to-address.svg"_s), tr("View in &Dump"),
                   [this, address]() { scrollToMemoryAddress(address); });
 
@@ -437,7 +454,7 @@ void DebuggerWindow::startPatchInstruction(VirtualMemoryAddress address)
     if (CPU::AssembleInstruction(&replacement_bits, address, std::string_view(text_utf8.constData(), text_utf8.size()),
                                  &error))
     {
-      patchInstruction(address, replacement_bits);
+      patchInstructions(address, address, replacement_bits);
       return;
     }
 
@@ -445,29 +462,101 @@ void DebuggerWindow::startPatchInstruction(VirtualMemoryAddress address)
   }
 }
 
-void DebuggerWindow::patchInstruction(VirtualMemoryAddress address, u32 bits)
+void DebuggerWindow::patchInstructions(VirtualMemoryAddress start_address, VirtualMemoryAddress end_address, u32 bits)
 {
-  Host::RunOnCoreThread([win = QPointer(this), address, bits]() mutable {
-    const bool success = CPU::SafeWriteMemoryWord(address, bits);
-    if (success)
-      CPU::InvalidateICacheAt(address);
+  Host::RunOnCoreThread([win = QPointer(this), start_address, end_address, bits]() mutable {
+    u32 success_count = 0;
+    std::optional<VirtualMemoryAddress> first_failed_address;
+    for (VirtualMemoryAddress address = start_address;; address += CPU::INSTRUCTION_SIZE)
+    {
+      if (CPU::SafeWriteMemoryWord(address, bits))
+      {
+        CPU::InvalidateICacheAt(address);
+        success_count++;
+      }
+      else if (!first_failed_address.has_value())
+      {
+        first_failed_address = address;
+      }
 
-    Host::RunOnUIThread([win = std::move(win), address, success]() {
+      if (address == end_address)
+        break;
+    }
+
+    const u32 instruction_count = ((end_address - start_address) / CPU::INSTRUCTION_SIZE) + 1;
+    Host::RunOnUIThread([win = std::move(win), start_address, success_count, instruction_count,
+                         first_failed_address]() {
       if (!win)
         return;
 
-      if (!success)
+      if (success_count > 0)
+      {
+        win->m_ui.codeView->refreshView();
+        win->m_ui.memoryView->forceRefresh();
+      }
+
+      if (first_failed_address.has_value())
       {
         QtUtils::AsyncMessageBox(
           win, QMessageBox::Critical, win->windowTitle(),
-          tr("Failed to write patched instruction to 0x%1.").arg(static_cast<uint>(address), 8, 16, QChar('0')));
-        return;
+          tr("Failed to write one or more patched instructions. Patched %1 of %2 instructions; the first failure was "
+             "at 0x%3.")
+            .arg(success_count)
+            .arg(instruction_count)
+            .arg(static_cast<uint>(first_failed_address.value()), 8, 16, QChar('0')));
+        win->reportMessage(tr("Patched %1 of %2 selected instructions.").arg(success_count).arg(instruction_count));
+      }
+      else if (instruction_count == 1)
+      {
+        win->reportMessage(tr("Patched instruction at 0x%1.").arg(static_cast<uint>(start_address), 8, 16, QChar('0')));
+      }
+      else
+      {
+        win->reportMessage(tr("Patched %1 instructions.").arg(instruction_count));
+      }
+    });
+  });
+}
+
+void DebuggerWindow::copySelectedCodeToClipboard()
+{
+  const std::optional<std::pair<VirtualMemoryAddress, VirtualMemoryAddress>> range =
+    m_ui.codeView->getSelectedAddressRange();
+  if (!range.has_value())
+    return;
+
+  Host::RunOnCoreThread([range = range.value()]() {
+    if (!System::IsValid())
+      return;
+
+    SmallString text;
+    u32 instruction_count = 0;
+    for (VirtualMemoryAddress address = range.first;; address += CPU::INSTRUCTION_SIZE)
+    {
+      if (instruction_count > 0)
+        text.append('\n');
+
+      text.append_format("0x{:08X} ", address);
+      if (u32 instruction_bits; CPU::SafeReadInstruction(address, &instruction_bits))
+      {
+        SmallString disassembly;
+        CPU::DisassembleInstruction(&disassembly, address, instruction_bits);
+        text.append(disassembly);
+      }
+      else
+      {
+        text.append("<invalid>");
       }
 
-      win->m_ui.codeView->refreshView();
-      win->m_ui.memoryView->forceRefresh();
-      win->reportMessage(tr("Patched instruction at 0x%1.").arg(static_cast<uint>(address), 8, 16, QChar('0')));
-    });
+      instruction_count++;
+      if (address == range.second)
+        break;
+    }
+
+    Host::CopyTextToClipboard(text);
+    Host::ReportDebuggerEvent(CPU::DebuggerEvent::Message,
+                              TRANSLATE_PLURAL_SSTR("DebuggerWindow", "Copied %n instruction(s) to the clipboard.",
+                                                    "CopyRange", static_cast<int>(instruction_count)));
   });
 }
 
@@ -591,10 +680,27 @@ void DebuggerWindow::closeEvent(QCloseEvent* event)
 {
   g_core_thread->disconnect(this);
   Host::RunOnCoreThread([]() { CPU::ClearBreakpoints(true, false); });
-  QtUtils::SaveWindowGeometry(this);
+  saveWindowState();
   saveGameSettings();
   QMainWindow::closeEvent(event);
   emit closed();
+}
+
+void DebuggerWindow::saveWindowState()
+{
+  QtUtils::SaveWindowGeometry(this, false);
+
+  const QByteArray state = QMainWindow::saveState().toBase64();
+  Core::SetBaseStringSettingValue(WINDOW_STATE_SECTION, WINDOW_STATE_KEY, state.constData());
+  Host::CommitBaseSettingChanges();
+}
+
+void DebuggerWindow::restoreWindowState()
+{
+  // NOTE: Geometry restored in QtUtils::ShowOrRaiseWindow().
+  const std::string state = Core::GetBaseStringSettingValue(WINDOW_STATE_SECTION, WINDOW_STATE_KEY);
+  if (!state.empty())
+    QMainWindow::restoreState(QByteArray::fromBase64(QByteArray::fromStdString(state)));
 }
 
 void DebuggerWindow::setupAdditionalUi()
@@ -651,6 +757,7 @@ void DebuggerWindow::connectSignals()
   connect(m_ui.codeView, &DebuggerCodeView::toggleBreakpointActivated, this,
           &DebuggerWindow::onCodeViewToggleBreakpointActivated);
   connect(m_ui.codeView, &DebuggerCodeView::commentActivated, this, &DebuggerWindow::onCodeViewCommentActivated);
+  connect(m_ui.codeView, &DebuggerCodeView::copyActivated, this, &DebuggerWindow::copySelectedCodeToClipboard);
   connect(m_ui.codeView, &QWidget::customContextMenuRequested, this, &DebuggerWindow::onCodeViewContextMenuRequested);
   connect(m_ui.callStackView, &QTreeView::doubleClicked, this, &DebuggerWindow::onCallStackItemDoubleClicked);
   connect(m_ui.stackView, &QTreeView::doubleClicked, this, &DebuggerWindow::onStackItemDoubleClicked);
@@ -1040,7 +1147,7 @@ void DebuggerWindow::loadGameSettings(bool clear_existing)
   }
 
   if (!queued_bps.empty())
-    reportMessage(tr("Loaded %n saved breakpoint(s).", nullptr, queued_bps.size()));
+    reportMessage(tr("Loaded %n saved breakpoint(s).", nullptr, static_cast<int>(queued_bps.size())));
 
   Host::RunOnCoreThread([win = QPointer<DebuggerWindow>(this), serial = m_game_serial, clear_existing,
                          queued_bps = std::move(queued_bps)]() mutable {

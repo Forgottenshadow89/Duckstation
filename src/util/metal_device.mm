@@ -1,10 +1,11 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "metal_device.h"
 
 #include "common/align.h"
 #include "common/assert.h"
+#include "common/bitutils.h"
 #include "common/cocoa_tools.h"
 #include "common/error.h"
 #include "common/file_system.h"
@@ -410,11 +411,20 @@ void MetalDevice::SetFeatures(CreateFlags create_flags)
   m_features.timed_present = true;
   m_features.shader_cache = true;
   m_features.pipeline_cache = false;
+  m_features.thread_safe_shader_compile = true;
   m_features.prefer_unused_textures = true;
 
   // Same feature bit for both.
   m_features.dxt_textures = m_features.bptc_textures =
     !HasCreateFlag(create_flags, CreateFlags::DisableCompressedTextures) && m_device.supportsBCTextureCompression;
+}
+
+u16 MetalDevice::GetShaderCacheVersion() const
+{
+  // Incorporate feature bits into the archive version so that device capability changes don't load the wrong shaders.
+  const bool barriers = (!m_features.framebuffer_fetch && m_features.feedback_loops);
+  return (BoolToUInt16(m_features.dual_source_blend) << 15) | (BoolToUInt16(m_features.framebuffer_fetch) << 14) |
+         (BoolToUInt16(m_features.texture_buffers) << 13) | (BoolToUInt16(barriers) << 12);
 }
 
 bool MetalDevice::LoadShaders(Error* error)
@@ -734,6 +744,16 @@ id<MTLDepthStencilState> MetalDevice::GetDepthState(const GPUPipeline::DepthStat
   }
 }
 
+std::unique_ptr<GPUPipeline> MetalDevice::LoadPipeline(const GPUPipeline::GraphicsConfig& config)
+{
+  // Effectively no difference between loading and creating here.
+  Error error;
+  std::unique_ptr<GPUPipeline> ret = CreatePipeline(config, &error);
+  if (!ret) [[unlikely]]
+    ERROR_LOG("Failed to create pipeline: {}", error.GetDescription());
+  return ret;
+}
+
 std::unique_ptr<GPUPipeline> MetalDevice::CreatePipeline(const GPUPipeline::GraphicsConfig& config, Error* error)
 {
   @autoreleasepool
@@ -885,6 +905,16 @@ std::unique_ptr<GPUPipeline> MetalDevice::CreatePipeline(const GPUPipeline::Grap
 
     return std::unique_ptr<GPUPipeline>(new MetalPipeline(pipeline, depth, config.layout, cull_mode, primitive));
   }
+}
+
+std::unique_ptr<GPUPipeline> MetalDevice::LoadPipeline(const GPUPipeline::ComputeConfig& config)
+{
+  // Effectively no difference between loading and creating here.
+  Error error;
+  std::unique_ptr<GPUPipeline> ret = CreatePipeline(config, &error);
+  if (!ret) [[unlikely]]
+    ERROR_LOG("Failed to create pipeline: {}", error.GetDescription());
+  return ret;
 }
 
 std::unique_ptr<GPUPipeline> MetalDevice::CreatePipeline(const GPUPipeline::ComputeConfig& config, Error* error)

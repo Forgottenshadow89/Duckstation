@@ -42,6 +42,8 @@ protected:
   void closeEvent(QCloseEvent* event) override;
 
 private:
+  void saveWindowState();
+  void restoreWindowState();
   void setupAdditionalUi();
   void connectSignals();
   void createModels();
@@ -49,7 +51,8 @@ private:
   void saveCurrentState();
   void setMemoryViewRegion(Bus::MemoryRegion region);
   void startPatchInstruction(VirtualMemoryAddress address);
-  void patchInstruction(VirtualMemoryAddress address, u32 bits);
+  void patchInstructions(VirtualMemoryAddress start_address, VirtualMemoryAddress end_address, u32 bits);
+  void copySelectedCodeToClipboard();
   void toggleBreakpoint(VirtualMemoryAddress address);
   void clearBreakpoints();
   bool tryFollowLoadStore(VirtualMemoryAddress address);

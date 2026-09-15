@@ -26,7 +26,11 @@ public:
   /// Sets the number of worker threads to be used by the task queue.
   /// Setting this to zero threads completes tasks on the calling thread.
   /// @param count The desired number of worker threads.
-  void SetWorkerCount(u32 count);
+  /// @param max_threads The maximum number of worker threads.
+  void SetWorkerCount(u16 count, u16 max_threads);
+
+  /// Returns the number of tasks remaining.
+  size_t GetOutstandingTasks();
 
   /// Submits a task to the queue for execution.
   /// @param func The task function to execute.
@@ -34,6 +38,10 @@ public:
 
   /// Waits for all submitted tasks to complete execution.
   void WaitForAll();
+
+  /// Executes a single task on the calling thread.
+  /// Returns false if there was no work to complete.
+  bool ExecuteOneTask();
 
 private:
   /// Waits for all submitted tasks to complete execution.
@@ -52,8 +60,10 @@ private:
   std::mutex m_mutex;
   std::deque<TaskFunctionType> m_tasks;
   size_t m_tasks_outstanding = 0;
+  u32 m_threads_busy = 0;
+  u16 m_max_threads = 0;
+  bool m_threads_done = false;
   std::condition_variable m_task_wait_cv;
   std::condition_variable m_tasks_done_cv;
   std::vector<std::thread> m_threads;
-  bool m_threads_done = false;
 };

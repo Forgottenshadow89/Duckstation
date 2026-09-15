@@ -4,21 +4,16 @@
 #pragma once
 
 #include "common/heap_array.h"
-#include "common/locked_ptr.h"
 #include "common/optional_with_status.h"
 #include "common/types.h"
 
 #include <functional>
-#include <mutex>
 #include <string_view>
 
 class Error;
 class ObjectArchive;
 
 namespace HTTPCache {
-
-/// Thread-safe locked pointer to the shared cache archive. Holds the cache mutex for its lifetime.
-using CacheArchivePtr = LockedPtr<ObjectArchive, std::mutex>;
 
 /// Data returned from a successful lookup.
 using LookupData = DynamicHeapArray<u8>;
@@ -49,8 +44,11 @@ std::string_view GetURLFilename(std::string_view url);
 /// Shuts down the HTTP cache, releasing the cache archive.
 void Shutdown();
 
-/// Returns a locked pointer to the shared cache archive, opening it on first use.
-CacheArchivePtr GetCacheArchive();
+/// Converts a URL to a cache key.
+std::span<const u8> URLToCacheKey(std::string_view key);
+
+/// Returns a pointer to the shared cache archive, opening it on first use.
+ObjectArchive& GetCacheArchive();
 
 /// Looks up @p url in the cache.
 /// On a Hit, the returned LookupResult holds the cached data.

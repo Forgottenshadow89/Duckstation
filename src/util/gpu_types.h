@@ -119,3 +119,25 @@ enum class GPUPresentResult : u8
   ExclusiveFullscreenLost,
   DeviceLost,
 };
+
+struct GPUShaderCacheKey
+{
+  static constexpr u32 MAX_OPAQUE_DATA_LENGTH = 16;
+
+  GPUShaderStage stage;
+  GPUShaderLanguage language;
+  u16 opaque_data_type;
+  u32 data_length;
+  union
+  {
+    struct
+    {
+      u64 source_hash_low;
+      u64 source_hash_high;
+      u64 entry_point_low;
+      u64 entry_point_high;
+    };
+
+    u8 data[MAX_OPAQUE_DATA_LENGTH];
+  };
+};

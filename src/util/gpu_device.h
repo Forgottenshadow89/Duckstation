@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "gpu_shader_cache.h"
 #include "gpu_texture.h"
+#include "object_archive.h"
 #include "window_info.h"
 
 #include "common/bitfield.h"
@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -550,6 +551,7 @@ public:
     bool gpu_timing : 1;
     bool shader_cache : 1;
     bool pipeline_cache : 1;
+    bool thread_safe_shader_compile : 1;
     bool prefer_unused_textures : 1;
     bool raster_order_views : 1;
     bool dxt_textures : 1;
@@ -612,7 +614,6 @@ public:
   static constexpr u32 UNIFORM_BUFFER_SIZE = 8 * 1024 * 1024;
   static constexpr u32 SMALL_TEXTURE_BUFFER_SIZE = 16 * 1024 * 1024;
   static constexpr u32 LARGE_TEXTURE_BUFFER_SIZE = 64 * 1024 * 1024;
-  static_assert(sizeof(GPUPipeline::GraphicsConfig::color_formats) == sizeof(GPUTextureFormat) * MAX_RENDER_TARGETS);
 
   GPUDevice();
   virtual ~GPUDevice();
@@ -625,6 +626,14 @@ public:
 
   /// Returns a string representing the specified language.
   static const char* ShaderLanguageToString(GPUShaderLanguage language);
+
+  /// Returns the cache key for a shader.
+  static GPUShaderCacheKey GetShaderCacheKey(GPUShaderStage stage, GPUShaderLanguage language,
+                                             std::string_view shader_code, std::string_view entry_point);
+  static GPUShaderCacheKey GetShaderCacheKey(GPUShaderStage stage, GPUShaderLanguage language, u16 opaque_data_type,
+                                             std::span<const u8> data);
+  static GPUShaderCacheKey GetShaderCacheKey(GPUShaderStage stage, GPUShaderLanguage language, u16 opaque_data_type,
+                                             const void* data, size_t data_size);
 
   /// Returns a string representing the specified vsync mode.
   static const char* VSyncModeToString(GPUVSyncMode mode);
@@ -762,10 +771,17 @@ public:
   virtual void InvalidateRenderTarget(GPUTexture* t);
 
   /// Shader abstraction.
+  std::unique_ptr<GPUShader> LoadShader(const GPUShaderCacheKey& key);
+  std::unique_ptr<GPUShader> CompileShader(const GPUShaderCacheKey& key, std::string_view source,
+                                           Error* error = nullptr, const char* entry_point = "main");
+  std::unique_ptr<GPUShader> LoadOrCompileShader(const GPUShaderCacheKey& key, std::string_view source,
+                                                 Error* error = nullptr, const char* entry_point = "main");
   std::unique_ptr<GPUShader> CreateShader(GPUShaderStage stage, GPUShaderLanguage language, std::string_view source,
                                           Error* error = nullptr, const char* entry_point = "main");
+  virtual std::unique_ptr<GPUPipeline> LoadPipeline(const GPUPipeline::GraphicsConfig& config) = 0;
   virtual std::unique_ptr<GPUPipeline> CreatePipeline(const GPUPipeline::GraphicsConfig& config,
                                                       Error* error = nullptr) = 0;
+  virtual std::unique_ptr<GPUPipeline> LoadPipeline(const GPUPipeline::ComputeConfig& config) = 0;
   virtual std::unique_ptr<GPUPipeline> CreatePipeline(const GPUPipeline::ComputeConfig& config,
                                                       Error* error = nullptr) = 0;
 
@@ -873,7 +889,8 @@ protected:
   virtual void DestroyDevice() = 0;
 
   std::string GetShaderCacheBaseName(std::string_view type) const;
-  virtual bool OpenPipelineCache(const std::string& path, Error* error);
+  virtual u16 GetShaderCacheVersion() const = 0;
+  virtual bool OpenPipelineCache(const std::string& path, u32 version, Error* error);
   virtual bool CreatePipelineCache(const std::string& path, Error* error);
   virtual bool ReadPipelineCache(DynamicHeapArray<u8> data, Error* error);
   virtual bool GetPipelineCacheData(DynamicHeapArray<u8>* data, Error* error);
@@ -912,8 +929,6 @@ protected:
   std::unique_ptr<GPUTexture> m_empty_texture;
   GPUSampler* m_nearest_sampler = nullptr;
   GPUSampler* m_linear_sampler = nullptr;
-
-  GPUShaderCache m_shader_cache;
 
 private:
   static constexpr u32 MAX_TEXTURE_POOL_SIZE = 125;
@@ -976,6 +991,8 @@ protected:
 
   bool m_gpu_timing_enabled = false;
   bool m_debug_device = false;
+
+  ObjectArchive m_shader_cache;
 };
 
 extern std::unique_ptr<GPUDevice> g_gpu_device;

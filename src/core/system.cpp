@@ -3682,11 +3682,13 @@ void System::FormatLatencyStats(SmallStringBase& str)
     Timer::ConvertValueToMilliseconds(static_cast<Timer::Value>(s_state.runahead_frames) * s_state.frame_period));
 
 #define BOLD(text) "\x02" text "\x01"
+#define DOT_SEP " \u2022 "
 
-  str.format("{}ms " BOLD("AL") " | {:.0f}ms " BOLD("AF") " | {:.0f}ms " BOLD("PF") " | {:.0f}ms " BOLD(
-               "IL") " | {} " BOLD("QF"),
+  str.format("{}ms " BOLD("AL") DOT_SEP "{:.0f}ms " BOLD("AF") DOT_SEP "{:.0f}ms " BOLD("PF") DOT_SEP
+             "{:.0f}ms " BOLD("IL") DOT_SEP "{} " BOLD("QF"),
              audio_latency, active_frame_time, pre_frame_time, input_latency, queued_frame_count);
 
+#undef DOT_SEP
 #undef BOLD
 }
 
@@ -4658,6 +4660,7 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
              g_settings.gpu_force_round_texcoords != old_settings.gpu_force_round_texcoords ||
              g_settings.gpu_filter_vram_writes != old_settings.gpu_filter_vram_writes ||
              g_settings.gpu_sprite_nearest_coverage != old_settings.gpu_sprite_nearest_coverage ||
+             g_settings.gpu_disable_upscaled_direct_textures != old_settings.gpu_disable_upscaled_direct_textures ||
              g_settings.gpu_texture_filter != old_settings.gpu_texture_filter ||
              g_settings.gpu_sprite_texture_filter != old_settings.gpu_sprite_texture_filter ||
              g_settings.gpu_dithering_mode != old_settings.gpu_dithering_mode ||

@@ -694,14 +694,21 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
 
   if (HasTrait(Trait::FilterFramebufferUploads))
   {
-    settings.gpu_filter_framebuffer_uploads = true;
-    settings.gpu_filter_framebuffer_uploads_minimum_width = gpu_filter_framebuffer_uploads_minimum_width.value();
-    settings.gpu_filter_framebuffer_uploads_minimum_height = gpu_filter_framebuffer_uploads_minimum_height.value();
-    if (display_osd_messages)
+    // If the user already enabled framebuffer upload filtering globally, keep their minimum upload
+    // size (1x1 by default, i.e. filter everything) instead of the conservative game database
+    // threshold, so partial uploads such as MDEC video strips (16 pixels wide) get filtered too.
+    // Palette/texture reads stay exact regardless, since the canonical subpixel is never filtered.
+    if (!settings.gpu_filter_framebuffer_uploads)
     {
-      INFO_LOG("GameDB: Filter framebuffer uploads minimum size set to {}x{}.",
-               settings.gpu_filter_framebuffer_uploads_minimum_width,
-               settings.gpu_filter_framebuffer_uploads_minimum_height);
+      settings.gpu_filter_framebuffer_uploads = true;
+      settings.gpu_filter_framebuffer_uploads_minimum_width = gpu_filter_framebuffer_uploads_minimum_width.value();
+      settings.gpu_filter_framebuffer_uploads_minimum_height = gpu_filter_framebuffer_uploads_minimum_height.value();
+      if (display_osd_messages)
+      {
+        INFO_LOG("GameDB: Filter framebuffer uploads minimum size set to {}x{}.",
+                 settings.gpu_filter_framebuffer_uploads_minimum_width,
+                 settings.gpu_filter_framebuffer_uploads_minimum_height);
+      }
     }
   }
 

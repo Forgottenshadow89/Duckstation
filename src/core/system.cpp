@@ -131,9 +131,9 @@ struct UndoSaveStateBuffer : public SaveStateBuffer
 
 } // namespace
 
-static const SettingsInterface& GetInputSourceSettingsLayer(std::unique_lock<std::mutex>& lock);
-static const SettingsInterface& GetControllerSettingsLayer(std::unique_lock<std::mutex>& lock);
-static const SettingsInterface& GetHotkeySettingsLayer(std::unique_lock<std::mutex>& lock);
+static const SettingsInterface& GetInputSourceSettingsLayer(std::unique_lock<Threading::Mutex>& lock);
+static const SettingsInterface& GetControllerSettingsLayer(std::unique_lock<Threading::Mutex>& lock);
+static const SettingsInterface& GetHotkeySettingsLayer(std::unique_lock<Threading::Mutex>& lock);
 
 static std::string GetExecutableNameForImage(IsoReader& iso, bool strip_subdirectories);
 static bool ReadExecutableFromImage(IsoReader& iso, std::string* out_executable_name,
@@ -183,7 +183,7 @@ static void InhibitScreensaver(bool inhibit);
 
 static void ClearSettingsLayers();
 static bool UpdateGameSettingsLayer();
-static void UpdateInputSettingsLayer(std::string input_profile_name, std::unique_lock<std::mutex>& lock);
+static void UpdateInputSettingsLayer(std::string input_profile_name, std::unique_lock<Threading::Mutex>& lock);
 static void UpdateRunningGame(const std::string& path, CDImage* image, bool booting);
 static bool CheckForRequiredSubQ(Error* error);
 static bool SwitchDiscFromSet(s32 direction, bool show_osd_message);
@@ -1095,7 +1095,7 @@ void System::ReloadInputBindings()
   InputManager::ReloadBindings(GetControllerSettingsLayer(lock), GetHotkeySettingsLayer(lock));
 }
 
-const SettingsInterface& System::GetInputSourceSettingsLayer(std::unique_lock<std::mutex>& lock)
+const SettingsInterface& System::GetInputSourceSettingsLayer(std::unique_lock<Threading::Mutex>& lock)
 {
   // Select input profile _or_ game settings, not both.
   if (const SettingsInterface* isi = Core::GetInputSettingsLayer();
@@ -1115,7 +1115,7 @@ const SettingsInterface& System::GetInputSourceSettingsLayer(std::unique_lock<st
   }
 }
 
-const SettingsInterface& System::GetControllerSettingsLayer(std::unique_lock<std::mutex>& lock)
+const SettingsInterface& System::GetControllerSettingsLayer(std::unique_lock<Threading::Mutex>& lock)
 {
   // Select input profile _or_ game settings, not both.
   if (const SettingsInterface* isi = Core::GetInputSettingsLayer())
@@ -1133,7 +1133,7 @@ const SettingsInterface& System::GetControllerSettingsLayer(std::unique_lock<std
   }
 }
 
-const SettingsInterface& System::GetHotkeySettingsLayer(std::unique_lock<std::mutex>& lock)
+const SettingsInterface& System::GetHotkeySettingsLayer(std::unique_lock<Threading::Mutex>& lock)
 {
   // Only add input profile layer if the option is enabled.
   if (const SettingsInterface* isi = Core::GetInputSettingsLayer();
@@ -1522,7 +1522,7 @@ bool System::UpdateGameSettingsLayer()
   return true;
 }
 
-void System::UpdateInputSettingsLayer(std::string input_profile_name, std::unique_lock<std::mutex>& lock)
+void System::UpdateInputSettingsLayer(std::string input_profile_name, std::unique_lock<Threading::Mutex>& lock)
 {
   if (!input_profile_name.empty())
   {
@@ -4658,9 +4658,13 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
                old_settings.gpu_use_software_renderer_for_memory_states ||
              g_settings.gpu_scaled_interlacing != old_settings.gpu_scaled_interlacing ||
              g_settings.gpu_force_round_texcoords != old_settings.gpu_force_round_texcoords ||
-             g_settings.gpu_filter_vram_writes != old_settings.gpu_filter_vram_writes ||
-             g_settings.gpu_sprite_nearest_coverage != old_settings.gpu_sprite_nearest_coverage ||
              g_settings.gpu_disable_upscaled_direct_textures != old_settings.gpu_disable_upscaled_direct_textures ||
+             g_settings.gpu_filter_framebuffer_uploads != old_settings.gpu_filter_framebuffer_uploads ||
+             g_settings.gpu_filter_framebuffer_uploads_minimum_width !=
+               old_settings.gpu_filter_framebuffer_uploads_minimum_width ||
+             g_settings.gpu_filter_framebuffer_uploads_minimum_height !=
+               old_settings.gpu_filter_framebuffer_uploads_minimum_height ||
+             g_settings.gpu_sprite_nearest_coverage != old_settings.gpu_sprite_nearest_coverage ||
              g_settings.gpu_texture_filter != old_settings.gpu_texture_filter ||
              g_settings.gpu_sprite_texture_filter != old_settings.gpu_sprite_texture_filter ||
              g_settings.gpu_dithering_mode != old_settings.gpu_dithering_mode ||

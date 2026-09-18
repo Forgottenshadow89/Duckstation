@@ -110,7 +110,7 @@ static void AddOSDMessage(OSDMessageType type, std::string key, OSDMessageIconTy
                           std::string title, std::string message);
 static void RemoveKeyedOSDMessage(std::string key);
 static void ClearOSDMessages();
-static void UpdateOSDMessageRunIdle(const std::unique_lock<std::mutex>& lock);
+static void UpdateOSDMessageRunIdle(const std::unique_lock<Threading::Mutex>& lock);
 static void AcquirePendingOSDMessages(Timer::Value current_time);
 static void DrawOSDMessages(Timer::Value current_time);
 static void CreateSoftwareCursorTextures();
@@ -208,14 +208,15 @@ struct ALIGN_TO_CACHE_LINE State
 {
   // Shared between both threads
 
-  // cached copies of WantCaptureKeyboard/Mouse, used to know when to dispatch events
+  // Cached ImGui input requests, used to know when to dispatch events.
   std::atomic_bool imgui_wants_keyboard{false};
   std::atomic_bool imgui_wants_mouse{false};
+  std::atomic_bool imgui_wants_text_input{false};
 
   std::array<ImGuiManager::SoftwareCursor, InputManager::MAX_SOFTWARE_CURSORS> software_cursors = {};
 
   std::deque<PostedOSDMessage> osd_posted_messages;
-  std::mutex osd_messages_lock;
+  Threading::Mutex osd_messages_lock;
 
   // Read by both threads
   ALIGN_TO_CACHE_LINE ImGuiContext* imgui_context = nullptr;
@@ -449,6 +450,10 @@ void ImGuiManager::Shutdown()
     ImGui::DestroyContext(s_state.imgui_context);
     s_state.imgui_context = nullptr;
   }
+
+  s_state.imgui_wants_keyboard.store(false, std::memory_order_release);
+  s_state.imgui_wants_text_input.store(false, std::memory_order_release);
+  s_state.imgui_wants_mouse.store(false, std::memory_order_release);
 }
 
 bool ImGuiManager::CreateGPUResources(Error* error)
@@ -564,7 +569,8 @@ void ImGuiManager::NewFrame(u64 current_time)
   // Disable nav input on the implicit (Debug##Default) window. Otherwise we end up requesting keyboard
   // focus when there's nothing there. We use GetCurrentWindowRead() because otherwise it'll make it visible.
   ImGui::GetCurrentWindowRead()->Flags |= ImGuiWindowFlags_NoNavInputs;
-  s_state.imgui_wants_keyboard.store(io.WantCaptureKeyboard, std::memory_order_relaxed);
+  s_state.imgui_wants_keyboard.store(io.WantCaptureKeyboard, std::memory_order_release);
+  s_state.imgui_wants_text_input.store(io.WantTextInput, std::memory_order_release);
   s_state.imgui_wants_mouse.store(io.WantCaptureMouse, std::memory_order_release);
 }
 
@@ -1095,7 +1101,7 @@ void ImGuiManager::AddOSDMessage(OSDMessageType type, std::string key, OSDMessag
     UpdateOSDMessageRunIdle(lock);
 }
 
-void ImGuiManager::UpdateOSDMessageRunIdle(const std::unique_lock<std::mutex>& lock)
+void ImGuiManager::UpdateOSDMessageRunIdle(const std::unique_lock<Threading::Mutex>& lock)
 {
   static constexpr auto cb = []() {
     VideoThread::SetRunIdleReason(VideoThread::RunIdleReason::OSDMessagesActive,
@@ -1583,7 +1589,7 @@ void ImGuiManager::SetGamepadButtonType(InputManager::GamepadButtonType type)
 
 bool ImGuiManager::WantsTextInput()
 {
-  return s_state.imgui_wants_keyboard.load(std::memory_order_acquire);
+  return s_state.imgui_wants_text_input.load(std::memory_order_acquire);
 }
 
 bool ImGuiManager::WantsMouseInput()
@@ -1593,7 +1599,7 @@ bool ImGuiManager::WantsMouseInput()
 
 void ImGuiManager::AddTextInput(std::string str)
 {
-  if (!s_state.imgui_context || !s_state.imgui_wants_keyboard.load(std::memory_order_acquire))
+  if (!s_state.imgui_context || !s_state.imgui_wants_text_input.load(std::memory_order_acquire))
     return;
 
   VideoThread::RunOnThread([str = std::move(str)]() {

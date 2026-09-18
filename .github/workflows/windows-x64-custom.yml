@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - vram-write-filtering
+      - vram-write-filtering-v2
 
 permissions:
   contents: read

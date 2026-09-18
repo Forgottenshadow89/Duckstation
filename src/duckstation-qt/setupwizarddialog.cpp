@@ -25,6 +25,7 @@
 
 #include "common/file_system.h"
 #include "common/string_util.h"
+#include "common/threading.h"
 
 #include "fmt/format.h"
 
@@ -195,8 +196,7 @@ void SetupWizardDialog::setupLanguagePage(bool initial)
   SettingWidgetBinder::DisconnectWidget(m_ui.language);
   m_ui.language->clear();
   InterfaceSettingsWidget::setupLanguageCombo(m_ui.language);
-  connect(m_ui.language, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-          &SetupWizardDialog::languageChanged);
+  connect(m_ui.language, &QComboBox::currentIndexChanged, this, &SetupWizardDialog::languageChanged);
 
   if (initial)
   {

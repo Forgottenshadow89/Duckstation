@@ -142,6 +142,7 @@ struct Locals
   MainWindowType current_main_window = MainWindowType::None;
   PauseSubMenu current_pause_submenu = PauseSubMenu::None;
   MainWindowType previous_main_window = MainWindowType::None;
+  MainWindowType toggled_main_window = MainWindowType::None;
   bool initialized = false;
   bool background_loaded = false;
   bool was_paused_on_quick_menu_open = false;
@@ -245,6 +246,7 @@ void FullscreenUI::OnSystemStarting()
     BeginTransition(LONG_TRANSITION_TIME, []() {
       ClearSaveStateEntryList();
       s_locals.current_main_window = MainWindowType::None;
+      s_locals.toggled_main_window = MainWindowType::None;
       QueueResetFocus(FocusResetType::ViewChanged);
       UpdateRunIdleState();
     });
@@ -295,6 +297,7 @@ void FullscreenUI::OnSystemDestroyed()
 
     s_locals.was_paused_on_quick_menu_open = false;
     s_locals.current_pause_submenu = PauseSubMenu::None;
+    s_locals.toggled_main_window = MainWindowType::None;
     ReturnToMainWindow(TransitionEffect::Fade, LONG_TRANSITION_TIME);
   });
 }
@@ -308,21 +311,30 @@ void FullscreenUI::PauseAndOpenMenuFromCoreThread(void (*callback)())
   // Do the pause early, that way the core thread doesn't push extra frames while the transition is happening.
   // But, we also don't want extra frames between the pause and the open, because otherwise we'll see the pause icon.
   const bool was_paused = System::IsPaused();
-
-  VideoThread::RunOnThread([callback, was_paused]() {
+  bool should_pause = false;
+  VideoThread::RunOnThreadAndSync([callback, was_paused, &should_pause]() {
     if (s_locals.current_main_window != MainWindowType::None)
       return;
 
     Initialize();
-    if (!CanCurrentMainWindowStack() || !SetPendingMainWindowSwitch())
+    if (!SetPendingMainWindowSwitch())
       return;
+
+    // Explicit open actions supersede a menu which was hidden by PauseAndToggleMenuFromCoreThread().
+    if (s_locals.toggled_main_window != MainWindowType::None)
+    {
+      s_locals.toggled_main_window = MainWindowType::None;
+      s_locals.previous_main_window = MainWindowType::None;
+      s_locals.current_pause_submenu = PauseSubMenu::None;
+    }
 
     s_locals.was_paused_on_quick_menu_open = was_paused;
     callback();
+    should_pause = !was_paused;
   });
 
   // See comment above. We want the video thread to start transitioning before the pause goes through.
-  if (!was_paused)
+  if (should_pause)
     System::PauseSystem(true);
 }
 
@@ -340,21 +352,91 @@ void FullscreenUI::OpenPauseMenu()
   });
 }
 
-void FullscreenUI::OpenCheatsMenu()
+void FullscreenUI::PauseAndToggleMenuFromCoreThread(void (*open_callback)(), void (*restored_callback)(),
+                                                    float transition_time)
 {
-  PauseAndOpenMenuFromCoreThread([]() {
-    BeginTransition(TransitionEffect::ZoomIn, SHORT_TRANSITION_TIME, []() {
-      if (!SwitchToGameSettings(SettingsPage::Cheats))
-      {
-        // We'll end up here when we're in batch mode and using a runtime-populated game list entry. There _might_ be
-        // one frame when we display the main settings instead of the game settings page, but it'll be part of the
-        // transition and not noticeable. That's what you get for not using the game list.
-        SwitchToMainWindow(MainWindowType::Settings);
-      }
+  DebugAssert(Host::IsOnCoreThread());
+  if (!System::IsValid())
+    return;
 
+  const bool was_paused = System::IsPaused();
+  bool should_pause = false;
+  VideoThread::RunOnThreadAndSync([open_callback, restored_callback, transition_time, was_paused, &should_pause]() {
+    Initialize();
+
+    // Dialogs cannot be hidden safely, since doing so would leave their callbacks pending while the game is running.
+    // A pending switch means another action already owns the current transition.
+    if (AreAnyDialogsOpen() || !SetPendingMainWindowSwitch())
+      return;
+
+    // Hide the current window without disturbing the state it owns.
+    if (s_locals.current_main_window != MainWindowType::None)
+    {
+      s_locals.toggled_main_window = s_locals.current_main_window;
+      BeginTransition(TransitionEffect::ZoomOut, SHORT_TRANSITION_TIME, []() {
+        s_locals.current_main_window = MainWindowType::None;
+        s_locals.has_pending_window_switch = false;
+        UpdateRunIdleState();
+        FixStateIfPaused();
+        UnpauseForMenuClose();
+      });
+      return;
+    }
+
+    // Restore the hidden window, or invoke the requested open action when there is no saved window. Start the
+    // transition before requesting the pause so an extra frame does not display the pause icon.
+    s_locals.was_paused_on_quick_menu_open = was_paused;
+    const bool restoring = (s_locals.toggled_main_window != MainWindowType::None);
+    BeginTransition(TransitionEffect::ZoomIn, transition_time, [open_callback, restored_callback, restoring]() {
       ForceKeyNavEnabled();
       EnqueueSoundEffect(SFX_NAV_ACTIVATE);
+
+      if (restoring)
+      {
+        s_locals.current_main_window = std::exchange(s_locals.toggled_main_window, MainWindowType::None);
+        s_locals.has_pending_window_switch = false;
+        UpdateRunIdleState();
+        FixStateIfPaused();
+
+        if (restored_callback)
+          restored_callback();
+      }
+      else
+      {
+        open_callback();
+      }
     });
+    should_pause = !was_paused;
+  });
+
+  if (should_pause)
+    System::PauseSystem(true);
+}
+
+void FullscreenUI::TogglePauseMenu()
+{
+  PauseAndToggleMenuFromCoreThread(
+    []() {
+      UpdateAchievementsPauseScreenInfo();
+      s_locals.current_pause_submenu = PauseSubMenu::None;
+      SwitchToMainWindow(MainWindowType::PauseMenu);
+    },
+    &UpdateAchievementsPauseScreenInfo);
+}
+
+void FullscreenUI::ToggleCheatsMenu()
+{
+  PauseAndToggleMenuFromCoreThread([]() {
+    if (!SwitchToGameSettings(SettingsPage::Cheats))
+    {
+      // We'll end up here when we're in batch mode and using a runtime-populated game list entry. There _might_ be
+      // one frame when we display the main settings instead of the game settings page, but it'll be part of the
+      // transition and not noticeable. That's what you get for not using the game list.
+      SwitchToMainWindow(MainWindowType::Settings);
+    }
+
+    ForceKeyNavEnabled();
+    EnqueueSoundEffect(SFX_NAV_ACTIVATE);
   });
 }
 
@@ -382,6 +464,7 @@ void FullscreenUI::ClosePauseMenu(TransitionEffect effect /*= TransitionEffect::
   if (!VideoThread::HasGPUBackend())
     return;
 
+  s_locals.toggled_main_window = MainWindowType::None;
   BeginTransition(effect, transition_time, []() {
     s_locals.current_pause_submenu = PauseSubMenu::None;
     SwitchToMainWindow(MainWindowType::None);
@@ -398,6 +481,7 @@ void FullscreenUI::ClosePauseMenuImmediately()
   CancelTransition();
   UnpauseForMenuClose();
 
+  s_locals.toggled_main_window = MainWindowType::None;
   s_locals.current_pause_submenu = PauseSubMenu::None;
   s_locals.has_pending_window_switch = false;
   SwitchToMainWindow(MainWindowType::None);
@@ -504,6 +588,7 @@ void FullscreenUI::ReturnToMainWindow(TransitionEffect effect, float transition_
 {
   BeginTransition(effect, transition_time, []() {
     s_locals.previous_main_window = MainWindowType::None;
+    s_locals.toggled_main_window = MainWindowType::None;
     s_locals.current_pause_submenu = PauseSubMenu::None;
     s_locals.has_pending_window_switch = false;
 
@@ -544,6 +629,7 @@ void FullscreenUI::Shutdown()
   s_locals.current_main_window = MainWindowType::None;
   s_locals.current_pause_submenu = PauseSubMenu::None;
   s_locals.previous_main_window = MainWindowType::None;
+  s_locals.toggled_main_window = MainWindowType::None;
   s_locals.was_paused_on_quick_menu_open = false;
   s_locals.has_pending_window_switch = false;
 

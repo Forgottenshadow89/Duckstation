@@ -36,6 +36,7 @@
 #include "common/log.h"
 #include "common/path.h"
 #include "common/string_util.h"
+#include "common/threading.h"
 
 #include "IconsEmoji.h"
 #include "IconsFontAwesome.h"
@@ -117,8 +118,8 @@ static void DrawPostProcessingSettingsPage();
 static void DrawAudioSettingsPage();
 static void DrawMemoryCardSettingsPage();
 static void DrawControllerSettingsPage();
-static void DrawAchievementsSettingsPage(std::unique_lock<std::mutex>& settings_lock);
-static void DrawAchievementsSettingsHeader(SettingsInterface* bsi, std::unique_lock<std::mutex>& settings_lock);
+static void DrawAchievementsSettingsPage(std::unique_lock<Threading::Mutex>& settings_lock);
+static void DrawAchievementsSettingsHeader(SettingsInterface* bsi, std::unique_lock<Threading::Mutex>& settings_lock);
 static void DrawAdvancedSettingsPage();
 static void DrawPatchesOrCheatsSettingsPage(bool cheats);
 
@@ -3036,6 +3037,9 @@ void FullscreenUI::DrawCoverDownloaderWindow()
       StringUtil::Strlcpy(s_settings_locals.cover_downloader_template_urls, StringUtil::JoinString(urls, '\n'),
                           sizeof(s_settings_locals.cover_downloader_template_urls));
     }
+
+    s_settings_locals.cover_downloader_use_serial_names =
+      Core::GetBaseBoolSettingValue("UI", "CoverDownloaderUseSerialFileNames", false);
   }
 
   ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, LayoutScale(10.0f));
@@ -3135,8 +3139,18 @@ void FullscreenUI::SaveCoverDownloaderURLs()
 {
   const std::vector<std::string> urls =
     StringUtil::SplitNewString(s_settings_locals.cover_downloader_template_urls, '\n');
-  if (urls != Core::GetBaseStringListSetting("UI", "CoverDownloaderURL"))
+  bool changed = (urls != Core::GetBaseStringListSetting("UI", "CoverDownloaderURL"));
+  if (changed)
     Core::SetBaseStringListSettingValue("UI", "CoverDownloaderURL", urls);
+  if (s_settings_locals.cover_downloader_use_serial_names !=
+      Core::GetBaseBoolSettingValue("UI", "CoverDownloaderUseSerialFileNames", false))
+  {
+    Core::SetBaseBoolSettingValue("UI", "CoverDownloaderUseSerialFileNames",
+                                  s_settings_locals.cover_downloader_use_serial_names);
+    changed = true;
+  }
+  if (changed)
+    Host::CommitBaseSettingChanges();
 }
 
 void FullscreenUI::DrawBIOSSettingsPage()
@@ -4812,6 +4826,34 @@ void FullscreenUI::DrawGraphicsSettingsPage()
                 "FMVs/backgrounds in some games, but may reduce the quality of render-to-texture effects."),
       "GPU", "DisableUpscaledDirectTextures", false, resolution_scale > 1);
 
+    const GPUTextureFilter sprite_texture_filtering =
+      Settings::ParseTextureFilterName(GetEffectiveTinyStringSetting(bsi, "GPU", "SpriteTextureFilter"))
+        .value_or(Settings::DEFAULT_GPU_TEXTURE_FILTER);
+    DrawToggleSetting(
+      bsi, FSUI_ICONVSTR(ICON_FA_FILTER, "Filter Framebuffer Uploads"),
+      FSUI_VSTR("Applies the selected sprite texture filter to framebuffer uploads. This can smooth backgrounds in "
+                "some games while preserving texture data and 24-bit video."),
+      "GPU", "FilterFramebufferUploads", false,
+      resolution_scale > 1 && sprite_texture_filtering != GPUTextureFilter::Nearest);
+    const bool filter_framebuffer_uploads = GetEffectiveBoolSetting(bsi, "GPU", "FilterFramebufferUploads", false);
+    if (filter_framebuffer_uploads)
+    {
+      const bool filter_framebuffer_upload_sizes_enabled =
+        (resolution_scale > 1 && sprite_texture_filtering != GPUTextureFilter::Nearest && filter_framebuffer_uploads);
+      DrawIntSpinBoxSetting(
+        bsi, FSUI_ICONVSTR(ICON_FA_RULER_HORIZONTAL, "Minimum Framebuffer Upload Width"),
+        FSUI_VSTR("Only filters framebuffer uploads at least this wide. Increase this value to avoid filtering texture "
+                  "data."),
+        "GPU", "FilterFramebufferUploadsMinimumWidth", 1, 1, VRAM_WIDTH, 1, "%dpx",
+        filter_framebuffer_upload_sizes_enabled);
+      DrawIntSpinBoxSetting(
+        bsi, FSUI_ICONVSTR(ICON_FA_RULER_VERTICAL, "Minimum Framebuffer Upload Height"),
+        FSUI_VSTR("Only filters framebuffer uploads at least this tall. Increase this value to avoid filtering texture "
+                  "data."),
+        "GPU", "FilterFramebufferUploadsMinimumHeight", 1, 1, VRAM_HEIGHT, 1, "%dpx",
+        filter_framebuffer_upload_sizes_enabled);
+    }
+
     DrawToggleSetting(bsi, FSUI_ICONVSTR(ICON_FA_SWATCHBOOK, "Texture Modulation Cropping (\"Old/v0\" GPU)"),
                       FSUI_VSTR("Crops vertex colours to 5:5:5 before modulating with the texture colour, which "
                                 "typically results in more visible banding."),
@@ -5478,7 +5520,8 @@ void FullscreenUI::DrawAudioSettingsPage()
   EndMenuButtons();
 }
 
-void FullscreenUI::DrawAchievementsSettingsHeader(SettingsInterface* bsi, std::unique_lock<std::mutex>& settings_lock)
+void FullscreenUI::DrawAchievementsSettingsHeader(SettingsInterface* bsi,
+                                                  std::unique_lock<Threading::Mutex>& settings_lock)
 {
   ImDrawList* const dl = ImGui::GetWindowDrawList();
 
@@ -5605,7 +5648,7 @@ void FullscreenUI::DrawAchievementsSettingsHeader(SettingsInterface* bsi, std::u
   ImGui::SetCursorPos(ImVec2(pos_backup.x, pos_backup.y + panel_height + (spacing * 3.0f)));
 }
 
-void FullscreenUI::DrawAchievementsSettingsPage(std::unique_lock<std::mutex>& settings_lock)
+void FullscreenUI::DrawAchievementsSettingsPage(std::unique_lock<Threading::Mutex>& settings_lock)
 {
   SettingsInterface* bsi = GetEditingSettingsInterface();
 

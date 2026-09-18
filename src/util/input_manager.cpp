@@ -78,6 +78,7 @@ struct InputBinding
   u8 num_keys = 0;
   u8 full_mask = 0;
   u8 current_mask = 0;
+  bool activate_when_captured = false;
 };
 
 struct PadVibrationBinding
@@ -146,7 +147,8 @@ static std::vector<std::string_view> SplitChord(std::string_view binding);
 static bool SplitBinding(std::string_view binding, std::string_view* source, std::string_view* sub_binding);
 static void PrettifyInputBindingPart(std::string_view binding, bool allow_icon, BindingIconMappingFunction mapper,
                                      SmallString& ret, bool& changed);
-static void AddBindings(const std::vector<std::string>& bindings, const InputEventHandler& handler);
+static void AddBindings(const std::vector<std::string>& bindings, bool activate_when_captured,
+                        const InputEventHandler& handler);
 static void UpdatePointerCount();
 
 static bool IsAxisHandler(const InputEventHandler& handler);
@@ -167,6 +169,8 @@ static bool ShouldMaskBackgroundInput(InputBindingKey key);
 static bool DoEventHook(InputBindingKey key, float value);
 static bool PreprocessEvent(InputBindingKey key, float value, GenericInputBinding generic_key);
 static bool ProcessEvent(InputBindingKey key, float value, bool skip_button_handlers);
+template<typename Predicate>
+static void ClearBindState(Predicate&& matches);
 
 static void LoadMacroButtonConfig(const SettingsInterface& si, const std::string& section, u32 pad,
                                   const Controller::ControllerInfo& cinfo);
@@ -174,9 +178,9 @@ static void ApplyMacroButton(const MacroButton& mb);
 static void UpdateMacroButtons();
 
 static size_t UpdateInputSubclassPolling(InputSubclass subclass, bool enable_all);
-static void UpdateInputSourceState(const SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock,
+static void UpdateInputSourceState(const SettingsInterface& si, std::unique_lock<Threading::Mutex>& settings_lock,
                                    InputSourceType type, std::unique_ptr<InputSource> (*factory_function)());
-static void ReloadSources(const SettingsInterface& sources_si, std::unique_lock<std::mutex>& settings_lock);
+static void ReloadSources(const SettingsInterface& sources_si, std::unique_lock<Threading::Mutex>& settings_lock);
 
 static const KeyCodeData* FindKeyCodeData(u32 usb_code);
 
@@ -637,13 +641,14 @@ void InputManager::PrettifyInputBindingPart(const std::string_view binding, bool
   ret.append(binding);
 }
 
-void InputManager::AddBindings(const std::vector<std::string>& bindings, const InputEventHandler& handler)
+void InputManager::AddBindings(const std::vector<std::string>& bindings, bool activate_when_captured,
+                               const InputEventHandler& handler)
 {
   for (const std::string& binding : bindings)
-    AddBinding(binding, handler);
+    AddBinding(binding, activate_when_captured, handler);
 }
 
-void InputManager::AddBinding(std::string_view binding, const InputEventHandler& handler)
+void InputManager::AddBinding(std::string_view binding, bool activate_when_captured, const InputEventHandler& handler)
 {
   std::shared_ptr<InputBinding> ibinding;
   const std::vector<std::string_view> chord_bindings(SplitChord(binding));
@@ -662,6 +667,7 @@ void InputManager::AddBinding(std::string_view binding, const InputEventHandler&
     {
       ibinding = std::make_shared<InputBinding>();
       ibinding->handler = handler;
+      ibinding->activate_when_captured = activate_when_captured;
     }
 
     if (ibinding->num_keys == MAX_KEYS_PER_BINDING)
@@ -955,7 +961,7 @@ void InputManager::AddHotkeyBindings(const SettingsInterface& si)
     if (bindings.empty())
       continue;
 
-    AddBindings(bindings, InputButtonEventHandler{hotkey.handler});
+    AddBindings(bindings, hotkey.activate_when_captured, InputButtonEventHandler{hotkey.handler});
   }
 }
 
@@ -978,15 +984,16 @@ void InputManager::AddPadBindings(const SettingsInterface& si, const std::string
             si.GetFloatValue(section.c_str(), TinyString::from_format("{}Scale", bi.name), 1.0f);
           const float deadzone =
             si.GetFloatValue(section.c_str(), TinyString::from_format("{}Deadzone", bi.name), 0.0f);
-          AddBindings(bindings, InputAxisEventHandler{[pad_index, bind_index = bi.bind_index, sensitivity,
-                                                       deadzone](float value) {
-                        if (!System::IsValid())
-                          return;
+          AddBindings(
+            bindings, false,
+            InputAxisEventHandler{[pad_index, bind_index = bi.bind_index, sensitivity, deadzone](float value) {
+              if (!System::IsValid())
+                return;
 
-                        Controller* c = System::GetController(pad_index);
-                        if (c)
-                          c->SetBindState(bind_index, ApplySingleBindingScale(sensitivity, deadzone, value));
-                      }});
+              Controller* c = System::GetController(pad_index);
+              if (c)
+                c->SetBindState(bind_index, ApplySingleBindingScale(sensitivity, deadzone, value));
+            }});
         }
       }
       break;
@@ -1094,7 +1101,7 @@ void InputManager::SynchronizePadEffectBindings(InputBindingKey key)
   for (PadVibrationBinding& vib_binding : s_state.pad_vibration_array)
   {
     // only matching devices
-    if (vib_binding.binding.source_type != key.source_type && vib_binding.binding.source_index != key.source_index)
+    if (vib_binding.binding.source_type != key.source_type || vib_binding.binding.source_index != key.source_index)
       continue;
 
     // need to find the max intensity for this binding, might be more than one if combined motors
@@ -1112,7 +1119,7 @@ void InputManager::SynchronizePadEffectBindings(InputBindingKey key)
   for (PadLEDBinding& led_binding : s_state.pad_led_array)
   {
     // only matching devices
-    if (led_binding.binding.source_type != key.source_type && led_binding.binding.source_index != key.source_index)
+    if (led_binding.binding.source_type != key.source_type || led_binding.binding.source_index != key.source_index)
       continue;
 
     // Need to pass it through unconditionally, otherwise if the LED was on it'll stay on.
@@ -1243,9 +1250,11 @@ bool InputManager::ProcessEvent(InputBindingKey key, float value, bool skip_butt
       }
       else if (binding->num_keys >= min_num_keys)
       {
+        const bool skip_button_handler = skip_button_handlers && !binding->activate_when_captured;
+
         // update state based on whether the whole chord was activated
         const u8 new_mask =
-          ((new_state && !skip_button_handlers) ? (binding->current_mask | bit) : (binding->current_mask & ~bit));
+          ((new_state && !skip_button_handler) ? (binding->current_mask | bit) : (binding->current_mask & ~bit));
         const bool prev_full_state = (binding->current_mask == binding->full_mask);
         const bool new_full_state = (new_mask == binding->full_mask);
         binding->current_mask = new_mask;
@@ -1278,7 +1287,7 @@ bool InputManager::ProcessEvent(InputBindingKey key, float value, bool skip_butt
               // We only need to cancel the binding if it was fully active before. Which in the above
               // case of Shift+F1 / F1, it will be.
               if (other_binding->current_mask == other_binding->full_mask)
-                std::get<InputButtonEventHandler>(other_binding->handler)(-1);
+                std::get<InputButtonEventHandler>(other_binding->handler)(InputButtonEvent::Cancelled);
 
               // Zero out the current bits so that we don't release this binding, if the other part
               // of the chord releases first.
@@ -1289,8 +1298,10 @@ bool InputManager::ProcessEvent(InputBindingKey key, float value, bool skip_butt
 
         if (prev_full_state != new_full_state && binding->num_keys >= min_num_keys)
         {
-          const s32 pressed = skip_button_handlers ? -1 : static_cast<s32>(value_to_pass > 0.0f);
-          std::get<InputButtonEventHandler>(binding->handler)(pressed);
+          const InputButtonEvent event =
+            skip_button_handler ? InputButtonEvent::Cancelled :
+                                  ((value_to_pass > 0.0f) ? InputButtonEvent::Pressed : InputButtonEvent::Released);
+          std::get<InputButtonEventHandler>(binding->handler)(event);
         }
       }
 
@@ -1302,14 +1313,14 @@ bool InputManager::ProcessEvent(InputBindingKey key, float value, bool skip_butt
   return true;
 }
 
-void InputManager::ClearBindStateFromSource(InputBindingKey key)
+template<typename Predicate>
+void InputManager::ClearBindState(Predicate&& matches)
 {
   // Why are we doing it this way? Because any of the bindings could cause a reload and invalidate our iterators :(.
   // Axis handlers should be fine, so we'll do those as a first pass.
   for (const auto& [match_key, binding] : s_state.binding_map)
   {
-    if (key.source_type != match_key.source_type || key.source_subtype != match_key.source_subtype ||
-        key.source_index != match_key.source_index || !IsAxisHandler(binding->handler))
+    if (!matches(match_key) || !IsAxisHandler(binding->handler))
     {
       continue;
     }
@@ -1332,8 +1343,7 @@ void InputManager::ClearBindStateFromSource(InputBindingKey key)
 
     for (const auto& [match_key, binding] : s_state.binding_map)
     {
-      if (key.source_type != match_key.source_type || key.source_subtype != match_key.source_subtype ||
-          key.source_index != match_key.source_index || IsAxisHandler(binding->handler))
+      if (!matches(match_key) || IsAxisHandler(binding->handler))
       {
         continue;
       }
@@ -1354,7 +1364,7 @@ void InputManager::ClearBindStateFromSource(InputBindingKey key)
 
         if (current_mask == binding->full_mask)
         {
-          std::get<InputButtonEventHandler>(binding->handler)(-1);
+          std::get<InputButtonEventHandler>(binding->handler)(InputButtonEvent::Cancelled);
           matched = true;
           break;
         }
@@ -1365,6 +1375,13 @@ void InputManager::ClearBindStateFromSource(InputBindingKey key)
         break;
     }
   } while (matched);
+}
+
+void InputManager::ClearBindStateFromSource(InputBindingKey key)
+{
+  ClearBindState([key](const InputBindingKey& match_key) {
+    return (key.source_type == match_key.source_type && key.source_index == match_key.source_index);
+  });
 }
 
 void InputManager::SynchronizeBindingHandlerState()
@@ -1432,7 +1449,7 @@ bool InputManager::PreprocessEvent(InputBindingKey key, float value, GenericInpu
     if (ImGuiManager::ProcessPointerButtonEvent(key, value))
       return true;
   }
-  else if (generic_key != GenericInputBinding::Unknown)
+  else if (key.source_type > InputSourceType::Pointer)
   {
     if (ImGuiManager::ProcessGenericInputEvent(generic_key, value) && value != 0.0f)
       return true;
@@ -1645,6 +1662,7 @@ void InputManager::UpdateInputIgnoreState()
     if (s_state.ignore_input_events)
     {
       VERBOSE_COLOR_LOG(StrongOrange, "Application in background, ignoring input events");
+      ClearBindState([](const InputBindingKey& key) { return (key.source_type > InputSourceType::Pointer); });
     }
     else
     {
@@ -1931,6 +1949,7 @@ void InputManager::OnInputDeviceConnected(InputBindingKey key, std::string_view 
 void InputManager::OnInputDeviceDisconnected(InputBindingKey key, std::string_view identifier)
 {
   INFO_LOG("Device '{}' disconnected", identifier);
+  ClearBindStateFromSource(key);
   Host::OnInputDeviceDisconnected(key, identifier);
 
   if (System::IsValid() || VideoThread::IsFullscreenUIRequested())
@@ -2143,17 +2162,18 @@ void InputManager::LoadMacroButtonConfig(const SettingsInterface& si, const std:
           if (deadzone != 0.0f)
             WARNING_LOG("Chord binding {} not supported with trigger deadzone {}.", trigger_binding, deadzone);
 
-          AddBinding(trigger_binding,
-                     InputButtonEventHandler{[pad = macro.pad_index, index = macro.macro_index](bool state) {
-                       if (!System::IsValid())
-                         return;
+          AddBinding(
+            trigger_binding, false,
+            InputButtonEventHandler{[pad = macro.pad_index, index = macro.macro_index](InputButtonEvent event) {
+              if (!System::IsValid())
+                return;
 
-                       SetMacroButtonState(pad, index, state);
-                     }});
+              SetMacroButtonState(pad, index, (event == InputButtonEvent::Pressed));
+            }});
         }
         else
         {
-          AddBindings(trigger_bindings,
+          AddBindings(trigger_bindings, false,
                       InputAxisEventHandler{[pad = macro.pad_index, index = macro.macro_index, deadzone](float value) {
                         if (!System::IsValid())
                           return;
@@ -2544,8 +2564,9 @@ bool InputManager::IsInputSourceEnabled(const SettingsInterface& si, InputSource
   return si.GetBoolValue("InputSources", InputSourceToString(type), GetInputSourceDefaultEnabled(type));
 }
 
-void InputManager::UpdateInputSourceState(const SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock,
-                                          InputSourceType type, std::unique_ptr<InputSource> (*factory_function)())
+void InputManager::UpdateInputSourceState(const SettingsInterface& si,
+                                          std::unique_lock<Threading::Mutex>& settings_lock, InputSourceType type,
+                                          std::unique_ptr<InputSource> (*factory_function)())
 {
   const bool enabled = IsInputSourceEnabled(si, type);
   std::unique_ptr<InputSource>& source = s_state.input_sources[static_cast<u32>(type)];
@@ -2578,7 +2599,7 @@ void InputManager::UpdateInputSourceState(const SettingsInterface& si, std::uniq
   }
 }
 
-void InputManager::ReloadSources(const SettingsInterface& sources_si, std::unique_lock<std::mutex>& settings_lock)
+void InputManager::ReloadSources(const SettingsInterface& sources_si, std::unique_lock<Threading::Mutex>& settings_lock)
 {
   const std::unique_lock lock(s_state.sources_mutex);
 
@@ -2613,7 +2634,7 @@ void InputManager::ReloadSources(const SettingsInterface& sources_si, std::uniqu
 
 void InputManager::ReloadSourcesAndBindings(const SettingsInterface& sources_si, const SettingsInterface& binding_si,
                                             const SettingsInterface& hotkey_binding_si,
-                                            std::unique_lock<std::mutex>& settings_lock)
+                                            std::unique_lock<Threading::Mutex>& settings_lock)
 {
   DebugAssert(Host::IsOnCoreThread());
   ReloadSources(sources_si, settings_lock);

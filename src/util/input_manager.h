@@ -20,6 +20,10 @@
 class Error;
 class SmallStringBase;
 
+namespace Threading {
+class Mutex;
+}
+
 /// Class, or source of an input event.
 enum class InputSourceType : u32
 {
@@ -101,8 +105,16 @@ struct InputBindingKeyHash
   static std::size_t operator()(const InputBindingKey& k) { return std::hash<u64>{}(k.bits); }
 };
 
+/// State transition passed to binary input handlers.
+enum class InputButtonEvent : s8
+{
+  Cancelled = -1,
+  Released = 0,
+  Pressed = 1,
+};
+
 /// Callback type for a binary event. Usually used for hotkeys.
-using InputButtonEventHandler = std::function<void(s32 value)>;
+using InputButtonEventHandler = std::function<void(InputButtonEvent event)>;
 
 /// Callback types for a normalized event. Usually used for pads.
 using InputAxisEventHandler = std::function<void(float value)>;
@@ -130,15 +142,15 @@ struct InputInterceptHook
 };
 
 /// Hotkeys are actions (e.g. toggle frame limit) which can be bound to keys or chords.
-/// The handler is called with an integer representing the key state, where 0 means that
-/// one or more keys were released, 1 means all the keys were pressed, and -1 means that
-/// the hotkey was cancelled due to a chord with more keys being activated.
+/// The handler receives Pressed when the full chord activates, Released when a key in an active
+/// chord is released, and Cancelled when input routing or a longer chord suppresses the action.
 struct HotkeyInfo
 {
   const char* name;
   const char* category;
   const char* display_name;
-  void (*handler)(s32 pressed);
+  void (*handler)(InputButtonEvent event);
+  bool activate_when_captured = false;
 };
 
 /// Generic input bindings. These roughly match a DualShock 4 or XBox One controller.
@@ -287,7 +299,8 @@ void ReloadBindings(const SettingsInterface& binding_si, const SettingsInterface
 
 /// Re-parses the sources part of the config and initializes any backends.
 void ReloadSourcesAndBindings(const SettingsInterface& sources_si, const SettingsInterface& binding_si,
-                              const SettingsInterface& hotkey_binding_si, std::unique_lock<std::mutex>& settings_lock);
+                              const SettingsInterface& hotkey_binding_si,
+                              std::unique_lock<Threading::Mutex>& settings_lock);
 
 /// Shuts down any enabled input sources.
 void CloseSources();
@@ -296,22 +309,22 @@ void CloseSources();
 void PollSources();
 
 /// Returns true if any bindings exist for the specified key.
-/// Can be safely called on another thread.
+/// Must be called on the core thread.
 bool HasAnyBindingsForKey(InputBindingKey key);
 
 /// Returns true if any bindings exist for the specified source + index.
-/// Can be safely called on another thread.
+/// Must be called on the core thread.
 bool HasAnyBindingsForSource(InputBindingKey key);
 
 /// Returns true if any bindings exist for the specified subclass.
-/// Can be safely called on another thread.
+/// Must be called on the core thread.
 bool HasAnyBindingsForSubclass(InputBindingKey key);
 
 /// Parses a string binding into its components. Use with external AddBinding().
 bool ParseBindingAndGetSource(std::string_view binding, InputBindingKey* key, InputSource** source);
 
 /// Externally adds a fixed binding. Be sure to call *after* ReloadBindings() otherwise it will be lost.
-void AddBinding(std::string_view binding, const InputEventHandler& handler);
+void AddBinding(std::string_view binding, bool activate_when_captured, const InputEventHandler& handler);
 
 /// Adds an external vibration binding.
 void AddVibrationBinding(u32 pad_index, u32 bind_index, const InputBindingKey& binding, InputSource* source);

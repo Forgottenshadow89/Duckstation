@@ -45,10 +45,11 @@ void UpdateRunIdleState();
 #ifndef __ANDROID__
 
 void OpenPauseMenu();
-void OpenCheatsMenu();
+void TogglePauseMenu();
+void ToggleCheatsMenu();
 void OpenDiscChangeMenu();
-void OpenAchievementsWindow();
-void OpenLeaderboardsWindow();
+void ToggleAchievementsWindow();
+void ToggleLeaderboardsWindow();
 
 class BackgroundProgressCallback final : public ProgressCallback
 {

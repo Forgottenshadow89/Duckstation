@@ -3023,7 +3023,7 @@ uint SampleVRAM(uint2 coords)
     return RGBA8ToRGBA5551(LoadVRAM(int2(coords)));
 
 #if POINT_SAMPLE
-  // Sample the block corner, which is kept bit-exact when VRAM write filtering is enabled.
+  // Sample the block corner, which is kept bit-exact when framebuffer upload filtering is enabled.
   return RGBA8ToRGBA5551(LoadVRAM(int2(coords * uint2(RESOLUTION_SCALE, RESOLUTION_SCALE))));
 #endif
 
@@ -3058,13 +3058,11 @@ uint SampleVRAM(uint2 coords)
   return std::move(ss).str();
 }
 
-std::string GPU_HW_ShaderGen::GenerateVRAMWriteFragmentShader(bool use_buffer, bool use_ssbo, bool write_mask_as_depth,
-                                                              bool write_depth_as_rt,
-                                                              GPUTextureFilter texture_filter) const
+std::string GPU_HW_ShaderGen::GenerateVRAMWriteFragmentShader(bool use_buffer, bool use_ssbo,
+                                                              GPUTextureFilter texture_filter, bool write_mask_as_depth,
+                                                              bool write_depth_as_rt) const
 {
   Assert(!write_mask_as_depth || (write_mask_as_depth != write_depth_as_rt));
-
-  const bool filtered = (texture_filter != GPUTextureFilter::Nearest);
 
   std::stringstream ss;
   WriteHeader(ss);
@@ -3073,8 +3071,9 @@ std::string GPU_HW_ShaderGen::GenerateVRAMWriteFragmentShader(bool use_buffer, b
   DefineMacro(ss, "WRITE_MASK_AS_DEPTH", write_mask_as_depth);
   DefineMacro(ss, "WRITE_DEPTH_AS_RT", write_depth_as_rt);
   DefineMacro(ss, "USE_BUFFER", use_buffer);
-  DefineMacro(ss, "FILTERED", filtered);
-  DefineMacro(ss, "TEXTURE_ALPHA_BLENDING", false);
+  const bool filtering = (texture_filter != GPUTextureFilter::Nearest);
+  if (filtering)
+    DefineMacro(ss, "TEXTURE_ALPHA_BLENDING", false);
 
   ss << "CONSTANT float2 VRAM_SIZE = float2(" << VRAM_WIDTH << ".0, " << VRAM_HEIGHT << ".0);\n";
 
@@ -3109,24 +3108,24 @@ std::string GPU_HW_ShaderGen::GenerateVRAMWriteFragmentShader(bool use_buffer, b
     ss << "#define GET_VALUE(buffer_offset) (LOAD_TEXTURE_BUFFER(samp0, int(buffer_offset)).r)\n\n";
   }
 
-  if (filtered)
+  if (filtering)
   {
-    // Scaffolding for reusing the batch texture filters. The write rect acts as the "texture",
-    // texpage is unused, and uv_limits clamps sampling to the uploaded data.
     ss << R"(
-#define TEXPAGE_VALUE uint2
+#define TEXPAGE_VALUE uint
 CONSTANT float4 TRANSPARENT_PIXEL_COLOR = float4(0.0, 0.0, 0.0, 0.0);
 
 float4 SampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits)
 {
-  float2 c = clamp(floor(coords), uv_limits.xy, uv_limits.zw);
+  uint2 icoords = uint2(floor(clamp(coords, uv_limits.xy, uv_limits.zw)));
 #if !USE_BUFFER
-  uint value = LOAD_TEXTURE(samp0, int2(c), 0).x;
+  uint value = LOAD_TEXTURE(samp0, int2(icoords), 0).x;
 #else
-  uint buffer_offset = u_buffer_base_offset + uint((c.y * u_size.x) + c.x);
-  uint value = GET_VALUE(buffer_offset) | u_mask_or_bits;
+  uint buffer_offset = u_buffer_base_offset + icoords.y * uint(u_size.x) + icoords.x;
+  uint value = GET_VALUE(buffer_offset);
 #endif
-  return RGBA5551ToRGBA8(value);
+  // We unconditionally set the mask bit to ensure that no pixels will be flagged as zero alpha/transparent.
+  // Not doing this breaks JINC2 and any other filters which do use the alpha values.
+  return float4(RGBA5551ToRGBA8(value).rgb, 1.0);
 }
 )";
 
@@ -3136,8 +3135,8 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits)
   DeclareFragmentEntryPoint(ss, 0, 1, {}, true, 1 + BoolToUInt32(write_depth_as_rt), false, write_mask_as_depth);
   ss << R"(
 {
-  float2 fcoords = v_pos.xy / u_resolution_scale;
-  float2 coords = floor(fcoords);
+  float2 native_coords = v_pos.xy / u_resolution_scale;
+  float2 coords = floor(native_coords);
 
   // make sure it's not oversized and out of range
   if ((coords.x < u_base_coords.x && coords.x >= u_end_coords.x) ||
@@ -3151,36 +3150,38 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits)
   offset.x = (coords.x < u_base_coords.x) ? (VRAM_SIZE.x - u_base_coords.x + coords.x) : (coords.x - u_base_coords.x);
   offset.y = (coords.y < u_base_coords.y) ? (VRAM_SIZE.y - u_base_coords.y + coords.y) : (coords.y - u_base_coords.y);
 
-#if !USE_BUFFER
-  uint value = LOAD_TEXTURE(samp0, int2(offset), 0).x;
-#else
-  uint buffer_offset = u_buffer_base_offset + uint((offset.y * u_size.x) + offset.x);
-  uint value = GET_VALUE(buffer_offset) | u_mask_or_bits;
-#endif
+  #if !USE_BUFFER
+    uint value = LOAD_TEXTURE(samp0, int2(offset), 0).x;
+  #else
+    uint buffer_offset = u_buffer_base_offset + uint((offset.y * u_size.x) + offset.x);
+    uint value = GET_VALUE(buffer_offset);
+  #endif
+)";
 
-  o_col0 = RGBA5551ToRGBA8(value);
-
-#if FILTERED
-  // Upscale-filter CPU->VRAM uploads (pre-rendered backgrounds, 2D images), like PeteOpenGL2Tweak's
-  // xBRZ texture scaler. The first subpixel of every source texel keeps its exact value so that any
-  // path that reinterprets raw 1x VRAM data (24-bit display decode, palette/CLUT fetches, which all
-  // sample block corners of the scaled texture) still sees bit-exact data. The mask bit (alpha) and
-  // depth are also always derived from the exact source value.
-  uint uscale = uint(u_resolution_scale);
-  uint2 subpixel = uint2(floor(v_pos.xy)) % uint2(uscale, uscale);
-  if (uscale > 1u && (subpixel.x != 0u || subpixel.y != 0u) && u_size.x >= 8.0 && u_size.y >= 8.0)
+  if (filtering)
   {
-    float2 local_coords = offset + frac(fcoords);
-    float4 uv_limits = float4(0.0, 0.0, u_size.x - 1.0, u_size.y - 1.0);
-    float4 texcol;
-    float ialpha;
-    FilteredSampleFromVRAM(uint2(0u, 0u), local_coords, uv_limits, texcol, ialpha);
+    ss << R"(
+  float4 original_color = RGBA5551ToRGBA8(value | u_mask_or_bits);
+  uint2 frag_coords = uint2(v_pos.xy);
+  uint2 canonical_coords = uint2(coords * u_resolution_scale);
+  bool canonical = (frag_coords.x == canonical_coords.x && frag_coords.y == canonical_coords.y);
 
-    // Undo the transparent-sample compensation; raw VRAM data blends towards black (color 0000h).
-    o_col0.rgb = texcol.rgb * ialpha;
+  float4 filtered_color;
+  float filtered_alpha;
+  FilteredSampleFromVRAM(0u, offset + frac(native_coords), float4(0.0, 0.0, u_size - float2(1.0, 1.0)),
+                         filtered_color, filtered_alpha);
+
+  // Native-resolution texture and 24-bit scanout fetches use the canonical sample. The mask bit belongs
+  // to the original VRAM pixel and must not be filtered.
+  o_col0 = float4(canonical ? original_color.rgb : filtered_color.rgb, original_color.a);
+)";
   }
-#endif
+  else
+  {
+    ss << "  o_col0 = RGBA5551ToRGBA8(value | u_mask_or_bits);\n";
+  }
 
+  ss << R"(
 #if WRITE_MASK_AS_DEPTH
   o_depth = (o_col0.a == 1.0) ? u_depth_value : 0.0;
 #elif WRITE_DEPTH_AS_RT

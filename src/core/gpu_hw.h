@@ -239,7 +239,7 @@ private:
 
   void DownloadVRAMFromGPU(u32 x, u32 y, u32 width, u32 height);
   void UpdateVRAMOnGPU(u32 x, u32 y, u32 width, u32 height, const void* data, u32 data_pitch, bool set_mask,
-                       bool check_mask, const GSVector4i bounds);
+                       bool check_mask, const GSVector4i bounds, bool allow_filtering);
   bool BlitVRAMReplacementTexture(GPUTexture* tex, u32 dst_x, u32 dst_y, u32 width, u32 height);
 
   /// Expands a line into two triangles.
@@ -297,7 +297,7 @@ private:
 
   GPUTextureFilter m_texture_filtering = GPUTextureFilter::Nearest;
   GPUTextureFilter m_sprite_texture_filtering = GPUTextureFilter::Nearest;
-  GPUTextureFilter m_vram_write_texture_filtering = GPUTextureFilter::Nearest;
+  GPUTextureFilter m_framebuffer_upload_filtering = GPUTextureFilter::Nearest;
   GPULineDetectMode m_line_detect_mode = GPULineDetectMode::Disabled;
   GPUDownsampleMode m_downsample_mode = GPUDownsampleMode::Disabled;
   GPUWireframeMode m_wireframe_mode = GPUWireframeMode::Disabled;
@@ -359,8 +359,8 @@ private:
   // [wrapped][interlaced]
   DimensionalArray<std::unique_ptr<GPUPipeline>, 2, 2> m_vram_fill_pipelines{};
 
-  // [depth_test]
-  std::array<std::unique_ptr<GPUPipeline>, 2> m_vram_write_pipelines{};
+  // [filtered][depth_test]
+  DimensionalArray<std::unique_ptr<GPUPipeline>, 2, 2> m_vram_write_pipelines{};
   std::array<std::unique_ptr<GPUPipeline>, 2> m_vram_copy_pipelines{};
 
   std::unique_ptr<GPUPipeline> m_vram_readback_pipeline;

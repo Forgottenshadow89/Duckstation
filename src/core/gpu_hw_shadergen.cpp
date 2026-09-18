@@ -2198,6 +2198,10 @@ std::string GPU_HW_ShaderGen::GenerateBatchFragmentShader(const BatchFragmentSha
   DefineMacro(ss, "USE_ROV_DEPTH", sel.use_rov_depth);
   DefineMacro(ss, "ROV_DEPTH_TEST", sel.rov_depth_test);
   DefineMacro(ss, "ROV_DEPTH_WRITE", sel.rov_depth_write);
+  DefineMacro(ss, "FILTER_NEAREST_COVERAGE",
+              sel.filter_nearest_coverage && sel.texture_filtering != GPUTextureFilter::Nearest);
+  DefineMacro(ss, "FILTER_CHROMA_KEY",
+              sel.filter_chroma_key && sel.texture_filtering != GPUTextureFilter::Nearest);
   DefineMacro(ss, "USE_DUAL_SOURCE", use_dual_source);
   DefineMacro(ss, "WRITE_MASK_AS_DEPTH", sel.write_mask_as_depth);
   DefineMacro(ss, "FORCE_ROUND_TEXCOORDS", sel.force_round_texcoords);
@@ -2309,7 +2313,7 @@ float4 SampleFromPageTexture(DECLARE_UV_LIMITS(float2 coords, float4 uv_limits))
 
 #if !PAGE_TEXTURE || TEXTURE_FILTERING
 
-float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, float4 uv_limits))
+float4 SampleFromVRAMRaw(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, float4 uv_limits))
 {
   #if PAGE_TEXTURE
     return SampleFromPageTexture(DECLARE_UV_LIMITS(coords, uv_limits));
@@ -2376,6 +2380,27 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, fl
       return SAMPLE_TEXTURE_LEVEL(samp0, ncoords * RCP_VRAM_SIZE, 0.0);
     #endif
   #endif
+}
+
+float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, float4 uv_limits))
+{
+  float4 color = SampleFromVRAMRaw(texpage, DECLARE_UV_LIMITS(coords, uv_limits));
+#if FILTER_CHROMA_KEY
+  // Some games (e.g. FF7) leave chroma matte garbage (green/blue/cyan/magenta/red screens)
+  // next to real content in their layered background tiles. It is never visible with nearest
+  // sampling, but texture filtering blends it into content edges as tinted dashes. Treat matte
+  // taps as transparent: the filters' alpha compensation then removes their contribution, and
+  // any residual darkening is caught by the luminance floor in the entry point. Transparent
+  // texels keep their standard filter behavior so cut-out content (foliage, cursors) stays
+  // smoothed.
+  bool matte = (color.g >= 0.55 && color.r <= 0.28 && color.b <= 0.28 && color.g >= (2.0 * max(color.r, color.b))) ||
+               (color.b >= 0.55 && color.r <= 0.28 && color.g <= 0.28 && color.b >= (2.0 * max(color.r, color.g))) ||
+               (color.r >= 0.55 && color.g <= 0.28 && color.b <= 0.28 && color.r >= (2.0 * max(color.g, color.b))) ||
+               (color.g >= 0.55 && color.b >= 0.55 && color.r <= 0.28 && min(color.g, color.b) >= (2.0 * color.r)) ||
+               (color.r >= 0.55 && color.b >= 0.55 && color.g <= 0.28 && min(color.r, color.b) >= (2.0 * color.g));
+  color = matte ? float4(0.0, 0.0, 0.0, 0.0) : color;
+#endif
+  return color;
 }
 
 #endif // !PAGE_TEXTURE || TEXTURE_FILTERING
@@ -2460,13 +2485,50 @@ float4 SampleFromVRAM(TEXPAGE_VALUE texpage, DECLARE_UV_LIMITS(float2 coords, fl
 
       ialpha = 1.0;
     #elif TEXTURE_FILTERING
+      #if FILTER_NEAREST_COVERAGE
+        // Exact texel under this pixel, used for coverage and the luminance floor below.
+        #if PAGE_TEXTURE
+          float4 ncol = SampleFromVRAMRaw(VECTOR_BROADCAST(TEXPAGE_VALUE, 0u), DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
+        #else
+          float4 ncol = SampleFromVRAMRaw(v_texpage, DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
+        #endif
+      #endif
       #if PAGE_TEXTURE
         FilteredSampleFromVRAM(VECTOR_BROADCAST(TEXPAGE_VALUE, 0u), v_tex0, v_uv_limits, texcol, ialpha);
       #else
         FilteredSampleFromVRAM(v_texpage, v_tex0, v_uv_limits, texcol, ialpha);
       #endif
-      if (ialpha < 0.5)
-        discard;
+      #if FILTER_NEAREST_COVERAGE
+        // Exact coverage: draw precisely the texels nearest sampling would draw. Eroding the
+        // silhouette reveals occluded matte behind layered backgrounds as colored dots, and
+        // growing it extends baked dark outlines onto the layers behind as black dots; both
+        // are avoided by matching nearest coverage exactly. Colors keep full filtering (with
+        // exact per-tap alpha compensation), and pixels are written opaque so edges never
+        // alpha-blend over the occluded matte either.
+        if (VECTOR_EQ(ncol, TRANSPARENT_PIXEL_COLOR))
+        {
+          // Outward-only silhouette smoothing: grow the cut-out edge when the filter has solid,
+          // non-near-black support. Near-black growth is suppressed because it is what plants
+          // matte/outline dots onto the layers behind; erosion is never allowed (it reveals
+          // occluded matte).
+          if (ialpha < 0.45 || (texcol.r + texcol.g + texcol.b) < 0.3)
+            discard;
+        }
+        else
+        {
+          // Luminance floor: matte tap replacements and failed transparency compensation pollute
+          // edges towards near-pure black, which legitimate smoothing (even against dark art
+          // outlines) practically never reaches. Snap only those pixels back to the exact color.
+          float tsum = texcol.r + texcol.g + texcol.b;
+          if (tsum < 0.15 && tsum < (0.5 * (ncol.r + ncol.g + ncol.b)))
+            texcol.rgb = ncol.rgb;
+          texcol.a = ncol.a;
+        }
+        ialpha = 1.0;
+      #else
+        if (ialpha < 0.5)
+          discard;
+      #endif
     #else
       texcol = SampleFromVRAM(v_texpage, DECLARE_UV_LIMITS(v_tex0, v_uv_limits));
       if (VECTOR_EQ(texcol, TRANSPARENT_PIXEL_COLOR))
@@ -2780,6 +2842,46 @@ float3 SampleVRAM24(uint2 icoords)
   return std::move(ss).str();
 }
 
+std::string GPU_HW_ShaderGen::GenerateDisplay24FilterFragmentShader(u32 resolution_scale,
+                                                                    GPUTextureFilter texture_filter) const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+
+  DefineMacro(ss, "TEXTURE_ALPHA_BLENDING", false);
+  ss << "CONSTANT float RESOLUTION_SCALE = " << resolution_scale << ".0;\n";
+
+  DeclareUniformBuffer(ss, {"float2 u_size"}, true);
+  DeclareTexture(ss, "samp0", 0, false);
+
+  // Scaffolding for reusing the batch texture filters on the extracted 24-bit display texture.
+  ss << R"(
+#define TEXPAGE_VALUE uint2
+CONSTANT float4 TRANSPARENT_PIXEL_COLOR = float4(0.0, 0.0, 0.0, 0.0);
+
+float4 SampleFromVRAM(TEXPAGE_VALUE texpage, float2 coords, float4 uv_limits)
+{
+  float2 c = clamp(floor(coords), uv_limits.xy, uv_limits.zw);
+  return float4(LOAD_TEXTURE(samp0, int2(c), 0).rgb, 1.0);
+}
+)";
+
+  WriteBatchTextureFilter(ss, texture_filter);
+
+  DeclareFragmentEntryPoint(ss, 0, 1, {}, true, 1);
+  ss << R"(
+{
+  float2 coords = v_pos.xy / RESOLUTION_SCALE;
+  float4 uv_limits = float4(0.0, 0.0, u_size.x - 1.0, u_size.y - 1.0);
+  float4 texcol;
+  float ialpha;
+  FilteredSampleFromVRAM(uint2(0u, 0u), coords, uv_limits, texcol, ialpha);
+  o_col0 = float4(texcol.rgb * ialpha, 1.0);
+})";
+
+  return std::move(ss).str();
+}
+
 std::string GPU_HW_ShaderGen::GenerateVRAMReplacementBlitFragmentShader() const
 {
   std::stringstream ss;
@@ -2884,7 +2986,8 @@ std::string GPU_HW_ShaderGen::GenerateWireframeFragmentShader() const
   return std::move(ss).str();
 }
 
-std::string GPU_HW_ShaderGen::GenerateVRAMReadFragmentShader(u32 resolution_scale, u32 multisamples) const
+std::string GPU_HW_ShaderGen::GenerateVRAMReadFragmentShader(u32 resolution_scale, u32 multisamples,
+                                                             bool point_sample) const
 {
   const bool msaa = (multisamples > 1);
 
@@ -2893,6 +2996,7 @@ std::string GPU_HW_ShaderGen::GenerateVRAMReadFragmentShader(u32 resolution_scal
   WriteColorConversionFunctions(ss);
 
   DefineMacro(ss, "MULTISAMPLING", msaa);
+  DefineMacro(ss, "POINT_SAMPLE", point_sample);
   ss << "CONSTANT uint RESOLUTION_SCALE = " << resolution_scale << "u;\n";
   ss << "CONSTANT uint MULTISAMPLES = " << multisamples << "u;\n";
 
@@ -2917,6 +3021,11 @@ uint SampleVRAM(uint2 coords)
 {
   if (RESOLUTION_SCALE == 1u)
     return RGBA8ToRGBA5551(LoadVRAM(int2(coords)));
+
+#if POINT_SAMPLE
+  // Sample the block corner, which is kept bit-exact when framebuffer upload filtering is enabled.
+  return RGBA8ToRGBA5551(LoadVRAM(int2(coords * uint2(RESOLUTION_SCALE, RESOLUTION_SCALE))));
+#endif
 
   // Box filter for downsampling.
   float4 value = float4(0.0, 0.0, 0.0, 0.0);

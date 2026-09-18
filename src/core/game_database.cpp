@@ -801,12 +801,23 @@ void GameDatabase::Entry::ApplySettings(Settings& settings, bool display_osd_mes
 
   if (HasTrait(Trait::DisableSpriteTextureFiltering))
   {
-    if (display_osd_messages && g_settings.gpu_sprite_texture_filter != GPUTextureFilter::Nearest)
+    // Enabling framebuffer upload filtering is an explicit opt-in to filtering 2D content, so keep the
+    // sprite filter active despite the compatibility trait. Use nearest coverage so that filtering
+    // cannot erode sprite silhouettes and reveal the occluded matte garbage that this trait protects
+    // against (e.g. FF7 / Legend of Dragoon layered field backgrounds).
+    if (!settings.gpu_filter_framebuffer_uploads || settings.gpu_sprite_texture_filter == GPUTextureFilter::Nearest)
     {
-      append_message(TRANSLATE_SV("GameDatabase", "Sprite texture filtering disabled."));
-    }
+      if (display_osd_messages && g_settings.gpu_sprite_texture_filter != GPUTextureFilter::Nearest)
+      {
+        append_message(TRANSLATE_SV("GameDatabase", "Sprite texture filtering disabled."));
+      }
 
-    settings.gpu_sprite_texture_filter = GPUTextureFilter::Nearest;
+      settings.gpu_sprite_texture_filter = GPUTextureFilter::Nearest;
+    }
+    else
+    {
+      settings.gpu_sprite_nearest_coverage = true;
+    }
   }
 
   if (HasTrait(Trait::DisableScaledInterlacing))

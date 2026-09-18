@@ -123,6 +123,14 @@ ALWAYS_INLINE bool ShouldAllowSpriteMode(u8 resolution_scale, GPUTextureFilter t
           (resolution_scale > 1 && g_gpu_settings.gpu_force_round_texcoords));
 }
 
+ALWAYS_INLINE GPUTextureFilter GetFramebufferUploadFilter(u8 resolution_scale)
+{
+  // Filtering framebuffer uploads (pre-rendered backgrounds, 24-bit images) only makes sense when upscaling.
+  return (resolution_scale > 1 && g_gpu_settings.gpu_filter_framebuffer_uploads) ?
+           g_gpu_settings.gpu_sprite_texture_filter :
+           GPUTextureFilter::Nearest;
+}
+
 ALWAYS_INLINE bool ShouldDisableColorPerspective()
 {
   return g_gpu_settings.gpu_pgxp_enable && g_gpu_settings.gpu_pgxp_texture_correction &&
@@ -286,6 +294,7 @@ bool GPU_HW::Initialize(bool upload_vram, Error* error)
   m_multisamples = Truncate8(std::min<u32>(g_gpu_settings.gpu_multisamples, g_gpu_device->GetMaxMultisamples()));
   m_texture_filtering = g_gpu_settings.gpu_texture_filter;
   m_sprite_texture_filtering = g_gpu_settings.gpu_sprite_texture_filter;
+  m_framebuffer_upload_filtering = GetFramebufferUploadFilter(m_resolution_scale);
   m_line_detect_mode = (m_resolution_scale > 1) ? g_gpu_settings.gpu_line_detect_mode : GPULineDetectMode::Disabled;
   m_downsample_mode = GetDownsampleMode(m_resolution_scale);
   m_wireframe_mode = g_gpu_settings.gpu_wireframe_mode;
@@ -540,6 +549,7 @@ bool GPU_HW::UpdateSettings(const GPUSettings& old_settings, Error* error)
      g_gpu_settings.IsUsingShaderBlending() != old_settings.IsUsingShaderBlending() ||
      m_texture_filtering != g_gpu_settings.gpu_texture_filter ||
      m_sprite_texture_filtering != g_gpu_settings.gpu_sprite_texture_filter || m_clamp_uvs != clamp_uvs ||
+     g_gpu_settings.gpu_sprite_nearest_coverage != old_settings.gpu_sprite_nearest_coverage ||
      (features.geometry_shaders && g_gpu_settings.gpu_wireframe_mode != old_settings.gpu_wireframe_mode) ||
      m_pgxp_depth_buffer != g_gpu_settings.UsingPGXPDepthBuffer() ||
      (features.noperspective_interpolation && g_gpu_settings.gpu_pgxp_enable &&
@@ -548,7 +558,8 @@ bool GPU_HW::UpdateSettings(const GPUSettings& old_settings, Error* error)
                                                   g_gpu_settings.gpu_sprite_texture_filter) ||
      (!old_settings.gpu_texture_cache && g_gpu_settings.gpu_texture_cache));
   const bool resolution_dependent_shaders_changed =
-    (m_resolution_scale != resolution_scale || m_multisamples != multisamples);
+    (m_resolution_scale != resolution_scale || m_multisamples != multisamples ||
+     m_framebuffer_upload_filtering != GetFramebufferUploadFilter(resolution_scale));
   const bool downsampling_shaders_changed =
     ((m_resolution_scale > 1) != (resolution_scale > 1) ||
      (resolution_scale > 1 && (g_gpu_settings.gpu_downsample_mode != old_settings.gpu_downsample_mode ||
@@ -605,6 +616,7 @@ bool GPU_HW::UpdateSettings(const GPUSettings& old_settings, Error* error)
   m_multisamples = multisamples;
   m_texture_filtering = g_gpu_settings.gpu_texture_filter;
   m_sprite_texture_filtering = g_gpu_settings.gpu_sprite_texture_filter;
+  m_framebuffer_upload_filtering = GetFramebufferUploadFilter(resolution_scale);
   m_line_detect_mode = (m_resolution_scale > 1) ? g_gpu_settings.gpu_line_detect_mode : GPULineDetectMode::Disabled;
   m_downsample_mode = GetDownsampleMode(resolution_scale);
   m_wireframe_mode = g_gpu_settings.gpu_wireframe_mode;
@@ -1093,6 +1105,7 @@ void GPU_HW::DestroyBuffers()
   g_gpu_device->RecycleTexture(std::move(m_downsample_texture));
   g_gpu_device->RecycleTexture(std::move(m_vram_extract_depth_texture));
   g_gpu_device->RecycleTexture(std::move(m_vram_extract_texture));
+  g_gpu_device->RecycleTexture(std::move(m_display_filter_texture));
   g_gpu_device->RecycleTexture(std::move(m_vram_read_texture));
   g_gpu_device->RecycleTexture(std::move(m_vram_depth_copy_texture));
   g_gpu_device->RecycleTexture(std::move(m_vram_depth_texture));
@@ -1464,6 +1477,14 @@ bool GPU_HW::CompilePipelines(Error* error)
     for (u8 render_mode = 0; render_mode < 5; render_mode++)
     {
       fssel.render_mode = static_cast<BatchRenderMode>(render_mode);
+
+      // Compat filtering only applies to opaque passes; semitransparent passes (dithered
+      // shadow/glow layers) keep the stock filter behavior, which renders them softly.
+      const bool compat_filter =
+        g_gpu_settings.gpu_sprite_nearest_coverage && (fssel.render_mode == BatchRenderMode::TransparencyDisabled ||
+                                                       fssel.render_mode == BatchRenderMode::OnlyOpaque);
+      fssel.filter_nearest_coverage = compat_filter;
+      fssel.filter_chroma_key = compat_filter;
 
       for (u8 transparency_mode = 0; transparency_mode < 5; transparency_mode++)
       {
@@ -2047,6 +2068,7 @@ bool GPU_HW::CompileResolutionDependentPipelines(Error* error)
   Timer timer;
 
   m_vram_readback_pipeline.reset();
+  m_display_24bit_filter_pipeline.reset();
   for (std::unique_ptr<GPUPipeline>& p : m_vram_extract_pipeline)
     p.reset();
 
@@ -2068,9 +2090,13 @@ bool GPU_HW::CompileResolutionDependentPipelines(Error* error)
 
   // VRAM read
   {
-    std::unique_ptr<GPUShader> fs =
-      g_gpu_device->CreateShader(GPUShaderStage::Fragment, shadergen.GetLanguage(),
-                                 shadergen.GenerateVRAMReadFragmentShader(m_resolution_scale, m_multisamples), error);
+    // Filtered framebuffer uploads keep the block corner bit-exact, so point sample it instead of
+    // averaging the filtered subpixels to keep CPU-visible VRAM round-trips exact.
+    std::unique_ptr<GPUShader> fs = g_gpu_device->CreateShader(
+      GPUShaderStage::Fragment, shadergen.GetLanguage(),
+      shadergen.GenerateVRAMReadFragmentShader(m_resolution_scale, m_multisamples,
+                                               m_framebuffer_upload_filtering != GPUTextureFilter::Nearest),
+      error);
     if (!fs)
       return false;
 
@@ -2111,6 +2137,25 @@ bool GPU_HW::CompileResolutionDependentPipelines(Error* error)
       GL_OBJECT_NAME_FMT(m_vram_readback_pipeline, "VRAM Extract Pipeline 24bit={} Depth={}", color_24bit,
                          depth_extract);
     }
+  }
+
+  // 24-bit display filtering (FMVs/static images), used when framebuffer upload filtering is enabled.
+  if (m_framebuffer_upload_filtering != GPUTextureFilter::Nearest && m_resolution_scale > 1)
+  {
+    std::unique_ptr<GPUShader> fs = g_gpu_device->CreateShader(
+      GPUShaderStage::Fragment, shadergen.GetLanguage(),
+      shadergen.GenerateDisplay24FilterFragmentShader(m_resolution_scale, m_framebuffer_upload_filtering), error);
+    if (!fs)
+      return false;
+
+    plconfig.fragment_shader = fs.get();
+    plconfig.layout = GPUPipeline::Layout::SingleTextureAndPushConstants;
+    plconfig.color_formats[1] = GPUTextureFormat::Unknown;
+
+    if (!(m_display_24bit_filter_pipeline = g_gpu_device->CreatePipeline(plconfig, error)))
+      return false;
+
+    GL_OBJECT_NAME(m_display_24bit_filter_pipeline, "24-bit Display Filter Pipeline");
   }
 
   INFO_LOG("Compiling resolution dependent pipelines took {:.2f} ms.", timer.GetTimeMilliseconds());
@@ -4421,21 +4466,46 @@ void GPU_HW::UpdateDisplay(const GPUBackendUpdateDisplayCommand* cmd)
 
     drew_anything = true;
 
-    VideoPresenter::SetDisplayTexture(m_vram_extract_texture.get(),
-                                      GSVector4i(0, 0, scaled_display_width, scaled_display_height));
+    GPUTexture* display_texture = m_vram_extract_texture.get();
+    u32 display_width = scaled_display_width;
+    u32 display_height = scaled_display_height;
+
+    // Upscale-filter 24-bit displays (FMVs/static images) when framebuffer upload filtering is enabled.
+    // 24-bit displays are always extracted at 1x, so this behaves like a plain image upscaler.
+    if (cmd->display_24bit && !interlaced && line_skip == 0 && m_display_24bit_filter_pipeline &&
+        g_gpu_device->ResizeTexture(&m_display_filter_texture, scaled_display_width * m_resolution_scale,
+                                    scaled_display_height * m_resolution_scale, GPUTexture::Type::RenderTarget,
+                                    GPUTextureFormat::RGBA8, GPUTexture::Flags::None))
+    {
+      GL_SCOPE("Filter 24-bit display");
+      display_width = scaled_display_width * m_resolution_scale;
+      display_height = scaled_display_height * m_resolution_scale;
+      g_gpu_device->InvalidateRenderTarget(m_display_filter_texture.get());
+      g_gpu_device->SetRenderTarget(m_display_filter_texture.get());
+      g_gpu_device->SetPipeline(m_display_24bit_filter_pipeline.get());
+      g_gpu_device->SetTextureSampler(0, m_vram_extract_texture.get(), g_gpu_device->GetNearestSampler());
+      g_gpu_device->SetViewportAndScissor(0, 0, display_width, display_height);
+
+      const float filter_uniforms[2] = {static_cast<float>(scaled_display_width),
+                                        static_cast<float>(scaled_display_height)};
+      g_gpu_device->DrawWithPushConstants(3, 0, filter_uniforms, sizeof(filter_uniforms));
+
+      m_display_filter_texture->MakeReadyForSampling();
+      display_texture = m_display_filter_texture.get();
+    }
+
+    VideoPresenter::SetDisplayTexture(display_texture, GSVector4i(0, 0, display_width, display_height));
 
     // Apply internal postfx if enabled.
     if (m_internal_postfx && m_internal_postfx->IsActive() &&
-        m_internal_postfx->CheckTargets(scaled_display_width, scaled_display_height, m_vram_texture->GetFormat(),
-                                        scaled_display_width, scaled_display_height, scaled_display_width,
-                                        scaled_display_height))
+        m_internal_postfx->CheckTargets(display_width, display_height, m_vram_texture->GetFormat(), display_width,
+                                        display_height, display_width, display_height))
     {
       const GSVector2i& video_size = VideoPresenter::GetVideoSize();
       GPUTexture* const postfx_output = m_internal_postfx->GetOutputTexture();
-      m_internal_postfx->Apply(
-        m_vram_extract_texture.get(), depth_source ? m_vram_extract_depth_texture.get() : nullptr,
-        m_internal_postfx->GetOutputTexture(), GSVector4i(0, 0, scaled_display_width, scaled_display_height),
-        video_size.x, video_size.y, cmd->display_vram_width, cmd->display_vram_height);
+      m_internal_postfx->Apply(display_texture, depth_source ? m_vram_extract_depth_texture.get() : nullptr,
+                               m_internal_postfx->GetOutputTexture(), GSVector4i(0, 0, display_width, display_height),
+                               video_size.x, video_size.y, cmd->display_vram_width, cmd->display_vram_height);
       VideoPresenter::SetDisplayTexture(postfx_output, postfx_output->GetRect());
     }
 

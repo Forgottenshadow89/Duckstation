@@ -51,6 +51,10 @@ public:
     bool rov_depth_test : 1;
     bool rov_depth_write : 1;
     bool disable_upscaled_direct_textures : 1;
+    // Compat filtering for DisableSpriteTextureFiltering games when framebuffer upload filtering is
+    // enabled: exact nearest coverage and chroma-key matte rejection while keeping the sprite filter.
+    bool filter_nearest_coverage : 1;
+    bool filter_chroma_key : 1;
   };
 
 public:
@@ -63,7 +67,7 @@ public:
   std::string GenerateBatchFragmentShader(const BatchFragmentShaderSelector sel) const;
   std::string GenerateWireframeGeometryShader() const;
   std::string GenerateWireframeFragmentShader() const;
-  std::string GenerateVRAMReadFragmentShader(u32 resolution_scale, u32 multisamples) const;
+  std::string GenerateVRAMReadFragmentShader(u32 resolution_scale, u32 multisamples, bool point_sample) const;
   std::string GenerateVRAMWriteFragmentShader(bool use_buffer, bool use_ssbo, GPUTextureFilter texture_filter,
                                               bool write_mask_as_depth, bool write_depth_as_rt) const;
   std::string GenerateVRAMCopyFragmentShader(bool write_mask_as_depth, bool write_depth_as_rt) const;
@@ -74,6 +78,7 @@ public:
   std::string GenerateVRAMClearDepthFragmentShader(bool write_depth_as_rt) const;
   std::string GenerateVRAMExtractFragmentShader(u32 resolution_scale, u32 multisamples, bool color_24bit,
                                                 bool depth_buffer) const;
+  std::string GenerateDisplay24FilterFragmentShader(u32 resolution_scale, GPUTextureFilter texture_filter) const;
   std::string GenerateVRAMReplacementBlitFragmentShader() const;
 
   std::string GenerateAdaptiveDownsampleVertexShader() const;

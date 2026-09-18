@@ -328,6 +328,7 @@ void Settings::Load(const SettingsInterface& si, const SettingsInterface& contro
   gpu_force_round_texcoords = si.GetBoolValue("GPU", "ForceRoundTextureCoordinates", false);
   gpu_disable_upscaled_direct_textures = si.GetBoolValue("GPU", "DisableUpscaledDirectTextures", false);
   gpu_filter_framebuffer_uploads = si.GetBoolValue("GPU", "FilterFramebufferUploads", false);
+  gpu_sprite_nearest_coverage = false; // runtime-only, set by the game database
   gpu_filter_framebuffer_uploads_minimum_width = std::clamp<u16>(
     si.GetSaturatedIntValue<u16>("GPU", "FilterFramebufferUploadsMinimumWidth", 1), 1, static_cast<u16>(VRAM_WIDTH));
   gpu_filter_framebuffer_uploads_minimum_height = std::clamp<u16>(

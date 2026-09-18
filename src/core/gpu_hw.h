@@ -297,6 +297,7 @@ private:
 
   GPUTextureFilter m_texture_filtering = GPUTextureFilter::Nearest;
   GPUTextureFilter m_sprite_texture_filtering = GPUTextureFilter::Nearest;
+  GPUTextureFilter m_framebuffer_upload_filtering = GPUTextureFilter::Nearest;
   GPULineDetectMode m_line_detect_mode = GPULineDetectMode::Disabled;
   GPUDownsampleMode m_downsample_mode = GPUDownsampleMode::Disabled;
   GPUWireframeMode m_wireframe_mode = GPUWireframeMode::Disabled;
@@ -369,6 +370,8 @@ private:
   std::array<std::unique_ptr<GPUPipeline>, 3> m_vram_extract_pipeline; // [24bit, 2=depth]
   std::unique_ptr<GPUTexture> m_vram_extract_texture;
   std::unique_ptr<GPUTexture> m_vram_extract_depth_texture;
+  std::unique_ptr<GPUPipeline> m_display_24bit_filter_pipeline;
+  std::unique_ptr<GPUTexture> m_display_filter_texture;
   std::unique_ptr<GPUPipeline> m_copy_depth_pipeline;
   std::unique_ptr<GPUPipeline> m_clear_depth_pipeline;
   std::unique_ptr<PostProcessing::Chain> m_internal_postfx;

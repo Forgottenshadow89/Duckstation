@@ -4664,6 +4664,7 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
                old_settings.gpu_filter_framebuffer_uploads_minimum_width ||
              g_settings.gpu_filter_framebuffer_uploads_minimum_height !=
                old_settings.gpu_filter_framebuffer_uploads_minimum_height ||
+             g_settings.gpu_sprite_nearest_coverage != old_settings.gpu_sprite_nearest_coverage ||
              g_settings.gpu_texture_filter != old_settings.gpu_texture_filter ||
              g_settings.gpu_sprite_texture_filter != old_settings.gpu_sprite_texture_filter ||
              g_settings.gpu_dithering_mode != old_settings.gpu_dithering_mode ||

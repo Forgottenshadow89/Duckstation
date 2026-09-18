@@ -482,7 +482,8 @@ GraphicsSettingsWidget::GraphicsSettingsWidget(SettingsWindow* dialog, QWidget* 
   dialog->registerWidgetHelp(
     m_ui.filterFramebufferUploads, tr("Filter Framebuffer Uploads"), tr("Unchecked"),
     tr("Applies the selected sprite texture filter to framebuffer uploads. This can smooth backgrounds in some "
-       "games while preserving texture data and 24-bit video."));
+       "games while preserving texture data. Also upscale-filters 24-bit video and images, and keeps the sprite "
+       "filter active in Final Fantasy VII and The Legend of Dragoon using an artifact-free compatibility mode."));
   dialog->registerWidgetHelp(
     m_ui.filterFramebufferUploadsMinimumWidth, tr("Minimum Framebuffer Upload Width"), tr("1 px"),
     tr("Only filters framebuffer uploads at least this wide. Increase this value to avoid filtering texture data."));

@@ -1,0 +1,68 @@
+name: Windows x64 (VRAM Write Filtering)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - vram-write-filtering
+      - vram-write-filtering-v2
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    name: "x64 Custom Build"
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 240
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Download x64 Dependencies
+      shell: bash
+      run: |
+        DEPS_VERSION=$(cat dep/PREBUILT-VERSION)
+        curl --fail --retry 5 --retry-all-errors -LO "https://github.com/duckstation/dependencies/releases/download/$DEPS_VERSION/deps-windows-x64.7z"
+        sha256sum --check --ignore-missing dep/PREBUILT-SHA256SUMS
+        7z x -odep/prebuilt deps-windows-x64.7z
+        rm deps-windows-x64.7z
+
+    - name: Download Patch Archives
+      shell: cmd
+      run: |
+        cd data/resources
+        curl --retry 5 --retry-all-errors -LO "https://github.com/duckstation/chtdb/releases/download/latest/cheats.zip"
+        curl --retry 5 --retry-all-errors -LO "https://github.com/duckstation/chtdb/releases/download/latest/patches.zip"
+
+    - name: Update RC Version Fields
+      shell: cmd
+      run: |
+        cd src\scmversion
+        call update_rc_version.bat
+        cd ..\..
+        git update-index --assume-unchanged src/duckstation-qt/duckstation-qt.rc
+
+    - name: Compile x64 Release Build
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        msbuild duckstation.sln -t:Build -p:Platform=x64;Configuration=ReleaseLTCG-Clang
+
+    - name: Remove Extra Bloat Before Archiving
+      shell: cmd
+      run: |
+        del /Q bin\x64\*.pdb bin\x64\*.exp bin\x64\*.lib bin\x64\*.iobj bin\x64\*.ipdb bin\x64\common-tests* bin\x64\updater* bin\x64\installer* bin\x64\uninstaller*
+
+    - name: Create x64 Release Archive
+      shell: cmd
+      run: |
+        "C:\Program Files\7-Zip\7z.exe" a -mx9 -r duckstation-windows-x64-vram-write-filtering.zip ./bin/x64/*
+
+    - name: Upload x64 Release Archive
+      uses: actions/upload-artifact@v7
+      with:
+        name: duckstation-windows-x64-vram-write-filtering
+        path: "duckstation-windows-x64-vram-write-filtering.zip"
+        if-no-files-found: error

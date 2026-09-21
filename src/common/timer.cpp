@@ -1,8 +1,10 @@
-// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
 // SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "timer.h"
+#include "intrin.h"
 #include "types.h"
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -117,13 +119,17 @@ void Timer::SleepUntil(Value value, bool exact)
     const Value wake_at = value - ConvertMillisecondsToValue(0.5);
     Value current = GetCurrentValue();
     if (wake_at > current)
+    {
       SleepUntil(wake_at, false);
+      current = GetCurrentValue();
+    }
 
     // And spin off whatever time is left.
-    do
+    while (current < value)
     {
+      PauseCPU();
       current = GetCurrentValue();
-    } while (current < value);
+    }
   }
   else
   {
@@ -205,13 +211,17 @@ void Timer::SleepUntil(Value value, bool exact)
     const Value wake_at = value - min_sleep_time;
     Value current = GetCurrentValue();
     if (wake_at > current)
+    {
       SleepUntil(wake_at, false);
+      current = GetCurrentValue();
+    }
 
     // And spin off whatever time is left.
-    do
+    while (current < value)
     {
+      PauseCPU();
       current = GetCurrentValue();
-    } while (current < value);
+    }
   }
   else
   {
@@ -374,7 +384,7 @@ void Timer::HybridSleep(std::uint64_t ns, std::uint64_t min_sleep_time)
 
 void Timer::NanoSleep(std::uint64_t ns)
 {
-#if defined(_WIN32)
+#ifdef _WIN32
   HANDLE timer = GetSleepTimer();
   if (timer)
   {
@@ -389,9 +399,6 @@ void Timer::NanoSleep(std::uint64_t ns)
   {
     Sleep(static_cast<std::uint32_t>(ns / 1000000));
   }
-#elif defined(__ANDROID__)
-  // Round down to the next millisecond.
-  usleep(static_cast<useconds_t>((ns / 1000000) * 1000));
 #else
   const struct timespec ts = {static_cast<long>(ns / 1000000000ULL), static_cast<long>(ns % 1000000000ULL)};
   nanosleep(&ts, nullptr);

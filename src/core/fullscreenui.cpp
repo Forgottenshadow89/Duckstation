@@ -644,7 +644,12 @@ void FullscreenUI::Shutdown()
   s_locals.was_paused_on_quick_menu_open = false;
   s_locals.has_pending_window_switch = false;
 
-  ClearAchievementsState();
+  {
+    const auto lock = Achievements::GetLock();
+    const auto overlay_lock = Achievements::GetOverlayLock();
+    ClearAchievementsState();
+  }
+
   ClearSettingsState();
   ClearGameListState();
   s_locals.current_time_string = {};
@@ -1848,7 +1853,7 @@ void FullscreenUI::DrawPauseMenu()
         {
           // skip second menu and go straight to cheevos if there's no lbs
           if (!Achievements::HasLeaderboards())
-            BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, &SwitchToAchievements);
+            BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, []() { SwitchToAchievements(); });
           else
             BeginTransition([]() { switch_submenu(PauseSubMenu::Achievements); });
         }
@@ -1912,10 +1917,10 @@ void FullscreenUI::DrawPauseMenu()
         }
 
         if (MenuButtonWithoutSummary(FSUI_ICONVSTR(ICON_FA_TROPHY, "Achievements")))
-          BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, &SwitchToAchievements);
+          BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, []() { SwitchToAchievements(); });
 
         if (MenuButtonWithoutSummary(FSUI_ICONVSTR(ICON_FA_STOPWATCH, "Leaderboards")))
-          BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, &SwitchToLeaderboards);
+          BeginTransition(TransitionEffect::ZoomIn, DEFAULT_TRANSITION_TIME, []() { SwitchToLeaderboards(); });
       }
       break;
     }

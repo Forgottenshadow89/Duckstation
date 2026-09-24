@@ -108,7 +108,7 @@ template<typename... T>
 static void ReportRCError(int err, fmt::format_string<T...> fmt, T&&... args);
 static void ClearGameInfo();
 static bool TryLoggingInWithToken();
-static void EnableHardcoreMode(bool display_message, bool display_game_summary);
+static void SetHardcoreModeState(bool enabled, bool display_message, bool display_game_summary);
 static void OnHardcoreModeChanged(bool enabled, bool display_message, bool display_game_summary);
 static bool IsRAIntegrationInitializing();
 static void FinishInitialize();
@@ -117,7 +117,7 @@ static void BeginLoadGame();
 static void UpdateGameSummary();
 static void UpdateModeSettings(const Settings& old_config);
 static DynamicHeapArray<u8> SaveStateToBuffer();
-static void LoadStateFromBuffer(std::span<const u8> data, std::unique_lock<std::recursive_mutex>& lock);
+static void LoadStateFromBuffer(std::span<const u8> data, std::unique_lock<Threading::Mutex>& lock);
 static bool SaveStateToBuffer(std::span<u8> data);
 static std::string GetImageURL(const char* image_name, u32 type);
 static void PrefetchNextAchievementBadge();
@@ -128,14 +128,17 @@ static void UpdatePrefetchAchievementBadgesOSDMessage();
 static TinyString DecryptLoginToken(std::string_view encrypted_token, std::string_view username);
 static TinyString EncryptLoginToken(std::string_view token, std::string_view username);
 
-static bool CreateClient(std::unique_lock<std::recursive_mutex>& lock, bool is_temporary_client);
-static void DestroyClient(std::unique_lock<std::recursive_mutex>& lock);
+static bool CreateClient(std::unique_lock<Threading::Mutex>& lock, bool is_temporary_client);
+static void DestroyClient(std::unique_lock<Threading::Mutex>& lock);
 static void ClientMessageCallback(const char* message, const rc_client_t* client);
 static uint32_t ClientReadMemory(uint32_t address, uint8_t* buffer, uint32_t num_bytes, rc_client_t* client);
 static void ClientServerCall(const rc_api_request_t* request, rc_client_server_callback_t callback, void* callback_data,
                              rc_client_t* client);
 static rc_api_server_response_t MakeRCAPIServerResponse(s32 status_code, const std::vector<u8>& data);
-static void WaitForServerCallsWithYield(std::unique_lock<std::recursive_mutex>& lock);
+
+// NOTE: Should be called **without** lock held.
+static void WaitForServerCalls();
+static void WaitForServerCallsWithYield(std::unique_lock<Threading::Mutex>& lock);
 
 static void ClientEventHandler(const rc_client_event_t* event, rc_client_t* client);
 static void HandleResetEvent(const rc_client_event_t* event);
@@ -164,7 +167,7 @@ static void ClientLoadGameCallback(int result, const char* error_message, rc_cli
 
 static void DisplayHardcoreDeferredMessage();
 static void DisplayAchievementSummary();
-static void UpdateRichPresence(std::unique_lock<std::recursive_mutex>& lock);
+static void UpdateRichPresence(std::unique_lock<Threading::Mutex>& lock);
 
 static bool EnsureAchievementsDatabaseOpen(Error* error = nullptr);
 static void CloseAchievementsDatabase();
@@ -200,7 +203,7 @@ static void SetAchievementPinnedInDatabase(u32 achievement_id, bool pinned);
 #ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
 
 static void BeginLoadRAIntegration();
-static void UnloadRAIntegration(std::unique_lock<std::recursive_mutex>& lock);
+static void UnloadRAIntegration(std::unique_lock<Threading::Mutex>& lock);
 
 // Just to make things even more annoying, RAIntegration callbacks on a worker thread.
 static void RAIntegrationClientLoginWithTokenCallback(int result, const char* error_message, rc_client_t* client,
@@ -236,7 +239,8 @@ struct State
   bool has_saved_credentials : 1 = false;
   bool reload_game_on_reset : 1 = false;
 
-  std::recursive_mutex mutex; // large
+  Threading::Mutex mutex;
+  Threading::Mutex overlay_mutex;
 
   std::vector<LeaderboardTrackerIndicator> active_leaderboard_trackers;
   std::vector<ActiveChallengeIndicator> active_challenge_indicators;
@@ -252,7 +256,7 @@ struct State
   Timer::Value rich_presence_poll_time = 0;
 
   std::optional<GameHash> game_hash;
-  u32 game_id = 0;
+  std::atomic<u32> game_id{0};
 
   std::string game_title;
   std::string game_badge_url;
@@ -304,9 +308,14 @@ TinyString Achievements::GameHashToString(const std::optional<GameHash>& hash)
   return ret;
 }
 
-std::unique_lock<std::recursive_mutex> Achievements::GetLock()
+std::unique_lock<Threading::Mutex> Achievements::GetLock()
 {
   return std::unique_lock(s_state.mutex);
+}
+
+std::lock_guard<Threading::Mutex> Achievements::GetOverlayLock()
+{
+  return std::lock_guard(s_state.overlay_mutex);
 }
 
 rc_client_t* Achievements::GetClient()
@@ -489,21 +498,20 @@ bool Achievements::IsActive()
 
 bool Achievements::IsHardcoreModeActive()
 {
-  if (!s_state.client)
-    return false;
-
-  const auto lock = GetLock();
-  return rc_client_get_hardcore_enabled(s_state.client);
+  // Does not take the lock here because we only call on the core thread.
+  // This is because it is called in other places like cheats which can have a reload triggered by HC mode.
+  DebugAssert(Host::IsOnCoreThread());
+  return (s_state.client && rc_client_get_hardcore_enabled(s_state.client));
 }
 
 bool Achievements::HasActiveGame()
 {
-  return s_state.game_id != 0;
+  return s_state.game_id.load(std::memory_order_acquire) != 0;
 }
 
 u32 Achievements::GetGameID()
 {
-  return s_state.game_id;
+  return s_state.game_id.load(std::memory_order_acquire);
 }
 
 bool Achievements::HasAchievementsOrLeaderboards()
@@ -564,7 +572,7 @@ void Achievements::Initialize()
   CreateClient(lock, false);
 }
 
-bool Achievements::CreateClient(std::unique_lock<std::recursive_mutex>& lock, bool is_temporary_client)
+bool Achievements::CreateClient(std::unique_lock<Threading::Mutex>& lock, bool is_temporary_client)
 {
   Assert(!s_state.client);
 
@@ -641,13 +649,16 @@ void Achievements::FinishInitialize()
   Host::OnAchievementsActiveChanged(true);
 }
 
-void Achievements::DestroyClient(std::unique_lock<std::recursive_mutex>& lock)
+void Achievements::DestroyClient(std::unique_lock<Threading::Mutex>& lock)
 {
   DebugAssert(IsActive());
-  WaitForServerCallsWithYield(lock);
+
+  lock.unlock();
+  WaitForServerCalls();
+  lock.lock();
 
   ClearGameInfo();
-  DisableHardcoreMode(false, false);
+  SetHardcoreModeState(false, false, false);
   CancelFetchGameListRequest();
   CancelFetchAllProgressRequest();
 
@@ -712,10 +723,10 @@ bool Achievements::TryLoggingInWithToken()
 
 void Achievements::UpdateSettings(const Settings& old_config)
 {
-  auto lock = GetLock();
-
   if (g_settings.achievements_enabled != old_config.achievements_enabled)
   {
+    auto lock = GetLock();
+
     // we're done here
     if (g_settings.achievements_enabled)
     {
@@ -731,10 +742,14 @@ void Achievements::UpdateSettings(const Settings& old_config)
     return;
   }
 
+  if (!IsActive())
+    return;
+
 #ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
   if (g_settings.achievements_use_raintegration != old_config.achievements_use_raintegration)
   {
     // RAIntegration requires a full client reload?
+    auto lock = GetLock();
     if (IsActive())
       DestroyClient(lock);
     CreateClient(lock, false);
@@ -746,33 +761,47 @@ void Achievements::UpdateSettings(const Settings& old_config)
   {
     // Enables have to wait for reset, disables can go through immediately.
     if (!g_settings.achievements_hardcore_mode)
-      DisableHardcoreMode(true, true);
+    {
+      const auto lock = GetLock();
+      SetHardcoreModeState(false, true, true);
+    }
   }
 
-  if (!g_settings.achievements_leaderboard_trackers)
+  if (old_config.achievements_leaderboard_trackers && !g_settings.achievements_leaderboard_trackers)
+  {
+    const auto overlay_lock = GetOverlayLock();
     s_state.active_leaderboard_trackers.clear();
+  }
 
   // remove progress indicator because it won't remove normally
-  if (g_settings.achievements_progress_indicator_mode == AchievementProgressIndicatorMode::Disabled)
+  if (old_config.achievements_progress_indicator_mode != AchievementProgressIndicatorMode::Disabled &&
+      g_settings.achievements_progress_indicator_mode == AchievementProgressIndicatorMode::Disabled)
+  {
+    const auto overlay_lock = GetOverlayLock();
     s_state.active_progress_indicator.reset();
+  }
 
   // If a game is active and these settings changed, reload the game to apply them.
   // Just unload and reload without destroying the client to preserve hardcore mode.
   // NOTE: Can't change spectator mode while game is loaded.
-  if (HasActiveGame() && (g_settings.achievements_encore_mode != old_config.achievements_encore_mode ||
-                          g_settings.achievements_spectator_mode != old_config.achievements_spectator_mode ||
-                          g_settings.achievements_track_unofficial != old_config.achievements_track_unofficial))
+  if (g_settings.achievements_encore_mode != old_config.achievements_encore_mode ||
+      g_settings.achievements_spectator_mode != old_config.achievements_spectator_mode ||
+      g_settings.achievements_track_unofficial != old_config.achievements_track_unofficial)
   {
-    // Save and restore state to preserve progress.
-    const DynamicHeapArray<u8> state_data = SaveStateToBuffer();
-    ClearGameInfo();
-    UpdateModeSettings(old_config);
-    BeginLoadGame();
-    LoadStateFromBuffer(state_data.cspan(), lock);
-  }
-  else
-  {
-    UpdateModeSettings(old_config);
+    auto lock = GetLock();
+    if (s_state.game_id.load(std::memory_order_relaxed) != 0) // has active game
+    {
+      // Save and restore state to preserve progress.
+      const DynamicHeapArray<u8> state_data = SaveStateToBuffer();
+      ClearGameInfo();
+      UpdateModeSettings(old_config);
+      BeginLoadGame();
+      LoadStateFromBuffer(state_data.cspan(), lock);
+    }
+    else
+    {
+      UpdateModeSettings(old_config);
+    }
   }
 }
 
@@ -833,16 +862,16 @@ uint32_t Achievements::ClientReadMemory(uint32_t address, uint8_t* buffer, uint3
 void Achievements::ClientServerCall(const rc_api_request_t* request, rc_client_server_callback_t callback,
                                     void* callback_data, rc_client_t* client)
 {
-  HTTPDownloader::RequestCallback hd_callback = [callback, callback_data](s32 status_code, Error& error,
-                                                                          std::string& content_type,
-                                                                          HTTPDownloader::RequestData& data) {
-    if (status_code != HTTPDownloader::HTTP_STATUS_OK)
-      ERROR_LOG("Server call failed: {}", error.GetDescription());
+  HTTPDownloader::RequestCallback hd_callback =
+    [callback, callback_data](s32 status_code, std::string_view error_message, std::string_view content_type,
+                              HTTPDownloader::RequestData data) {
+      if (status_code != HTTPDownloader::HTTP_STATUS_OK)
+        ERROR_LOG("Server call failed: {}", error_message);
 
-    const rc_api_server_response_t rr = MakeRCAPIServerResponse(status_code, data);
-    const auto lock = GetLock();
-    callback(&rr, callback_data);
-  };
+      const rc_api_server_response_t rr = MakeRCAPIServerResponse(status_code, data);
+      const auto lock = GetLock();
+      callback(&rr, callback_data);
+    };
 
   const std::array<const char* const, 1> headers = {s_state.http_user_agent_header.c_str()};
   if (request->post_data)
@@ -893,10 +922,17 @@ rc_api_server_response_t Achievements::MakeRCAPIServerResponse(s32 status_code, 
   }
 }
 
-void Achievements::WaitForServerCallsWithYield(std::unique_lock<std::recursive_mutex>& lock)
+void Achievements::WaitForServerCalls()
 {
-  HTTPDownloader::WaitForAllRequestsFromOwnerWithYield(
-    &s_state, [&lock]() { lock.unlock(); }, [&lock]() { lock.lock(); });
+  HTTPDownloader::WaitForAllRequestsFromOwner(&s_state);
+}
+
+void Achievements::WaitForServerCallsWithYield(std::unique_lock<Threading::Mutex>& lock)
+{
+  DebugAssert(lock.owns_lock());
+  lock.unlock();
+  WaitForServerCalls();
+  lock.lock();
 }
 
 void Achievements::IdleUpdate()
@@ -1010,7 +1046,7 @@ void Achievements::UpdateGameSummary()
   rc_client_get_user_game_summary(s_state.client, &s_state.game_summary);
 }
 
-void Achievements::UpdateRichPresence(std::unique_lock<std::recursive_mutex>& lock)
+void Achievements::UpdateRichPresence(std::unique_lock<Threading::Mutex>& lock)
 {
   if (!s_state.has_rich_presence)
     return;
@@ -1061,7 +1097,7 @@ void Achievements::OnSystemStarting(bool disable_hardcore_mode)
   {
     // only enable hardcore mode if we're logged in, or waiting for a login response
     if (!disable_hardcore_mode && g_settings.achievements_hardcore_mode && IsLoggedInOrLoggingIn())
-      EnableHardcoreMode(false, false);
+      SetHardcoreModeState(true, false, false);
   }
 }
 
@@ -1085,7 +1121,7 @@ void Achievements::OnSystemDestroyed()
   if (IsActive())
   {
     ClearGameInfo();
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
   }
 }
 
@@ -1101,7 +1137,7 @@ void Achievements::OnSystemReset()
   {
     // This will raise the silly reset event, but we can safely ignore that since we're immediately resetting the client
     DEV_LOG("Enabling hardcore mode after reset");
-    EnableHardcoreMode(true, true);
+    SetHardcoreModeState(true, true, true);
   }
 
   DEV_LOG("Reset client");
@@ -1129,9 +1165,11 @@ void Achievements::SetGameHash(const std::optional<GameHash>& hash)
   INFO_COLOR_LOG(StrongOrange, "RA Hash: {}", GameHashToString(s_state.game_hash));
 
   // just set the hash if inactive
-  if (!IsActive() || IsRAIntegrationInitializing())
+  if (!IsActive())
+    return;
+  if (IsRAIntegrationInitializing())
   {
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
     return;
   }
 
@@ -1156,7 +1194,6 @@ void Achievements::SetGameHash(const std::optional<GameHash>& hash)
 
 std::optional<Achievements::GameHash> Achievements::GetGameHash()
 {
-  const auto lock = GetLock();
   return s_state.game_hash;
 }
 
@@ -1165,7 +1202,7 @@ void Achievements::BeginLoadGame()
   if (!s_state.game_hash.has_value())
   {
     // no need to go through ClientLoadGameCallback, just bail out straight away
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
     return;
   }
 
@@ -1186,7 +1223,7 @@ void Achievements::ClientLoadGameCallback(int result, const char* error_message,
     if (was_disc_change)
       ClearGameInfo();
 
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
     return;
   }
   else if (result == RC_LOGIN_REQUIRED)
@@ -1209,7 +1246,7 @@ void Achievements::ClientLoadGameCallback(int result, const char* error_message,
     if (was_disc_change)
       ClearGameInfo();
 
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
     return;
   }
 
@@ -1220,7 +1257,7 @@ void Achievements::ClientLoadGameCallback(int result, const char* error_message,
     if (was_disc_change)
       ClearGameInfo();
 
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
     return;
   }
 
@@ -1230,22 +1267,23 @@ void Achievements::ClientLoadGameCallback(int result, const char* error_message,
            has_achievements ? "Yes" : "No", has_leaderboards ? "Yes" : "No");
 
   // Only display summary if the game title has changed across discs.
-  const bool display_summary = (s_state.game_id != info->id || s_state.game_title != info->title);
+  const bool display_summary =
+    (s_state.game_id.load(std::memory_order_relaxed) != info->id || s_state.game_title != info->title);
 
   // If the game has an RA entry but no achievements or leaderboards, we should not enforce hardcore mode.
   if (!has_achievements && !has_leaderboards)
   {
     WARNING_LOG("Game '{}' has no achievements or leaderboards, disabling hardcore mode.", info->title);
-    DisableHardcoreMode(false, false);
+    SetHardcoreModeState(false, false, false);
   }
 
-  s_state.game_id = info->id;
   s_state.game_title = info->title;
   s_state.has_achievements = has_achievements;
   s_state.has_leaderboards = has_leaderboards;
   s_state.has_rich_presence = rc_client_has_rich_presence(client);
   s_state.game_badge_url =
     info->badge_url ? std::string(info->badge_url) : GetImageURL(info->badge_name, RC_IMAGE_TYPE_GAME);
+  s_state.game_id.store(info->id, std::memory_order_release);
 
   // prefetch the game badge before any of the achievement badges, because the popup for the game summary
   // is going to display, and we don't want a placeholder stuck there until after the badges finish
@@ -1285,12 +1323,16 @@ void Achievements::ClearGameInfo()
 {
   DiscordPresence::UpdateDetails({}, {});
 
-  FullscreenUI::ClearAchievementsState();
+  {
+    const auto lock = GetOverlayLock();
 
-  s_state.active_leaderboard_trackers = {};
-  s_state.active_challenge_indicators = {};
-  s_state.active_progress_indicator.reset();
-  s_state.pinned_achievement_indicators = {};
+    FullscreenUI::ClearAchievementsState();
+
+    s_state.active_leaderboard_trackers = {};
+    s_state.active_challenge_indicators = {};
+    s_state.active_progress_indicator.reset();
+    s_state.pinned_achievement_indicators = {};
+  }
 
   if (s_state.load_game_request)
   {
@@ -1299,7 +1341,6 @@ void Achievements::ClearGameInfo()
   }
   rc_client_unload_game(s_state.client);
 
-  s_state.game_id = 0;
   s_state.game_title = {};
   s_state.game_badge_url = {};
   s_state.reload_game_on_reset = false;
@@ -1308,12 +1349,15 @@ void Achievements::ClearGameInfo()
   s_state.has_rich_presence = false;
   s_state.rich_presence_string = {};
   s_state.game_summary = {};
+  s_state.game_id.store(0, std::memory_order_release);
 }
 
 void Achievements::DisplayAchievementSummary()
 {
   if (g_settings.achievements_notifications)
   {
+    const bool hardcore_enabled = rc_client_get_hardcore_enabled(s_state.client);
+
     SmallString summary;
     if (s_state.game_summary.num_core_achievements > 0)
     {
@@ -1327,7 +1371,7 @@ void Achievements::DisplayAchievementSummary()
                                  s_state.game_summary.points_unlocked));
 
       summary.append('\n');
-      if (IsHardcoreModeActive())
+      if (hardcore_enabled)
       {
         summary.append(
           TRANSLATE_SV("Achievements", "Hardcore mode is enabled. Cheats and save states are unavailable."));
@@ -1342,11 +1386,14 @@ void Achievements::DisplayAchievementSummary()
       summary.assign(TRANSLATE_SV("Achievements", "This game has no achievements."));
     }
 
-    FullscreenUI::AddAchievementNotification("AchievementsSummary",
-                                             IsHardcoreModeActive() ? ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME_HC :
-                                                                      ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME,
-                                             s_state.game_badge_url, s_state.game_title, std::string(summary),
-                                             RA_LOGO_ICON_NAME, FullscreenUI::AchievementNotificationNoteType::Image);
+    {
+      const auto lock = Achievements::GetOverlayLock();
+      FullscreenUI::AddAchievementNotification("AchievementsSummary",
+                                               hardcore_enabled ? ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME_HC :
+                                                                  ACHIEVEMENT_SUMMARY_NOTIFICATION_TIME,
+                                               s_state.game_badge_url, s_state.game_title, std::string(summary),
+                                               RA_LOGO_ICON_NAME, FullscreenUI::AchievementNotificationNoteType::Image);
+    }
 
     if (s_state.game_summary.num_unsupported_achievements > 0)
     {
@@ -1420,12 +1467,15 @@ void Achievements::HandleUnlockEvent(const rc_client_event_t* event)
   const rc_client_achievement_t* const cheevo = event->achievement;
   DebugAssert(cheevo);
 
-  INFO_LOG("Achievement {} ({}) for game {} unlocked", cheevo->id, cheevo->title, s_state.game_id);
+  INFO_LOG("Achievement {} ({}) for game {} unlocked", cheevo->id, cheevo->title,
+           s_state.game_id.load(std::memory_order_relaxed));
   if (cheevo->category == RC_CLIENT_ACHIEVEMENT_CATEGORY_UNOFFICIAL && !IsUsingRAIntegration())
     StoreUnofficialAchievementUnlockInDatabase(cheevo);
 
   UpdateGameSummary();
   UpdateProgressDatabaseFromCurrentGame();
+
+  const auto lock = Achievements::GetOverlayLock();
   SetAchievementPinned(cheevo->id, false);
 
   if (g_settings.achievements_notifications)
@@ -1452,7 +1502,7 @@ void Achievements::HandleUnlockEvent(const rc_client_event_t* event)
 
 void Achievements::HandleGameCompleteEvent(const rc_client_event_t* event)
 {
-  INFO_LOG("Game {} ({}) complete", s_state.game_id, s_state.game_title);
+  INFO_LOG("Game {} ({}) complete", s_state.game_id.load(std::memory_order_relaxed), s_state.game_title);
   UpdateGameSummary();
 
   if (g_settings.achievements_notifications)
@@ -1463,6 +1513,7 @@ void Achievements::HandleGameCompleteEvent(const rc_client_event_t* event)
                            s_state.game_summary.num_unlocked_achievements),
       TRANSLATE_PLURAL_STR("Achievements", "%n points", "Achievement points", s_state.game_summary.points_unlocked));
 
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       "achievement_mastery", GAME_COMPLETE_NOTIFICATION_TIME, s_state.game_badge_url, s_state.game_title,
       std::move(message), ICON_EMOJI_TROPHY, FullscreenUI::AchievementNotificationNoteType::IconText);
@@ -1485,6 +1536,7 @@ void Achievements::HandleSubsetCompleteEvent(const rc_client_event_t* event)
                            s_state.game_summary.num_unlocked_achievements),
       TRANSLATE_PLURAL_STR("Achievements", "%n points", "Achievement points", s_state.game_summary.points_unlocked));
 
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       "achievement_mastery", GAME_COMPLETE_NOTIFICATION_TIME, std::move(badge_path), std::string(event->subset->title),
       std::move(message), ICON_EMOJI_CHECKMARK_BUTTON, FullscreenUI::AchievementNotificationNoteType::IconText);
@@ -1497,6 +1549,7 @@ void Achievements::HandleLeaderboardStartedEvent(const rc_client_event_t* event)
 
   if (g_settings.achievements_leaderboard_notifications)
   {
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       fmt::format("leaderboard_{}", event->leaderboard->id), LEADERBOARD_STARTED_NOTIFICATION_TIME,
       s_state.game_badge_url, std::string(event->leaderboard->title),
@@ -1511,6 +1564,7 @@ void Achievements::HandleLeaderboardFailedEvent(const rc_client_event_t* event)
 
   if (g_settings.achievements_leaderboard_notifications)
   {
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       fmt::format("leaderboard_{}", event->leaderboard->id), LEADERBOARD_FAILED_NOTIFICATION_TIME,
       s_state.game_badge_url, std::string(event->leaderboard->title),
@@ -1550,6 +1604,7 @@ void Achievements::HandleLeaderboardSubmittedEvent(const rc_client_event_t* even
                       value_strings[std::min<u8>(event->leaderboard->format, NUM_RC_CLIENT_LEADERBOARD_FORMATS - 1)])),
                     event->leaderboard->tracker_value ? event->leaderboard->tracker_value : "Unknown"));
 
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       fmt::format("leaderboard_{}", event->leaderboard->id),
       static_cast<float>(g_settings.achievements_leaderboard_duration), s_state.game_badge_url,
@@ -1587,6 +1642,7 @@ void Achievements::HandleLeaderboardScoreboardEvent(const rc_client_event_t* eve
       TinyString::from_format(TRANSLATE_FS("Achievements", "Leaderboard Position: {0} of {1}"),
                               event->leaderboard_scoreboard->new_rank, event->leaderboard_scoreboard->num_entries));
 
+    const auto lock = Achievements::GetOverlayLock();
     FullscreenUI::AddAchievementNotification(
       fmt::format("leaderboard_{}", event->leaderboard->id),
       static_cast<float>(g_settings.achievements_leaderboard_duration), s_state.game_badge_url,
@@ -1603,9 +1659,10 @@ void Achievements::HandleLeaderboardTrackerShowEvent(const rc_client_event_t* ev
   if (!g_settings.achievements_leaderboard_trackers)
     return;
 
+  const auto lock = GetOverlayLock();
   const u32 id = event->leaderboard_tracker->id;
-  auto it = std::find_if(s_state.active_leaderboard_trackers.begin(), s_state.active_leaderboard_trackers.end(),
-                         [id](const auto& it) { return it.tracker_id == id; });
+  auto it =
+    std::ranges::find_if(s_state.active_leaderboard_trackers, [id](const auto& it) { return it.tracker_id == id; });
   if (it != s_state.active_leaderboard_trackers.end())
   {
     WARNING_LOG("Leaderboard tracker {} already active", id);
@@ -1627,8 +1684,9 @@ void Achievements::HandleLeaderboardTrackerHideEvent(const rc_client_event_t* ev
   const u32 id = event->leaderboard_tracker->id;
   DEV_LOG("Hiding leaderboard tracker: {}", id);
 
-  auto it = std::find_if(s_state.active_leaderboard_trackers.begin(), s_state.active_leaderboard_trackers.end(),
-                         [id](const auto& it) { return it.tracker_id == id; });
+  const auto lock = GetOverlayLock();
+  const auto it =
+    std::ranges::find_if(s_state.active_leaderboard_trackers, [id](const auto& it) { return it.tracker_id == id; });
   if (it == s_state.active_leaderboard_trackers.end())
     return;
 
@@ -1641,8 +1699,9 @@ void Achievements::HandleLeaderboardTrackerUpdateEvent(const rc_client_event_t* 
   const u32 id = event->leaderboard_tracker->id;
   DEV_LOG("Updating leaderboard tracker: {}: {}", id, event->leaderboard_tracker->display);
 
-  auto it = std::find_if(s_state.active_leaderboard_trackers.begin(), s_state.active_leaderboard_trackers.end(),
-                         [id](const auto& it) { return it.tracker_id == id; });
+  const auto lock = GetOverlayLock();
+  const auto it =
+    std::ranges::find_if(s_state.active_leaderboard_trackers, [id](const auto& it) { return it.tracker_id == id; });
   if (it == s_state.active_leaderboard_trackers.end())
     return;
 
@@ -1652,9 +1711,12 @@ void Achievements::HandleLeaderboardTrackerUpdateEvent(const rc_client_event_t* 
 
 void Achievements::HandleAchievementChallengeIndicatorShowEvent(const rc_client_event_t* event)
 {
-  if (const auto it =
-        std::find_if(s_state.active_challenge_indicators.begin(), s_state.active_challenge_indicators.end(),
-                     [event](const ActiveChallengeIndicator& it) { return it.achievement == event->achievement; });
+  DEV_LOG("Show challenge indicator for {} ({})", event->achievement->id, event->achievement->title);
+
+  const auto lock = GetOverlayLock();
+  if (const auto it = std::ranges::find_if(
+        s_state.active_challenge_indicators,
+        [event](const ActiveChallengeIndicator& it) { return it.achievement == event->achievement; });
       it != s_state.active_challenge_indicators.end())
   {
     it->active = true;
@@ -1682,18 +1744,18 @@ void Achievements::HandleAchievementChallengeIndicatorShowEvent(const rc_client_
                              .time_remaining = LEADERBOARD_STARTED_NOTIFICATION_TIME,
                              .opacity = 0.0f,
                              .active = true});
-
-  DEV_LOG("Show challenge indicator for {} ({})", event->achievement->id, event->achievement->title);
 }
 
 void Achievements::HandleAchievementChallengeIndicatorHideEvent(const rc_client_event_t* event)
 {
-  auto it = std::find_if(s_state.active_challenge_indicators.begin(), s_state.active_challenge_indicators.end(),
+  DEV_LOG("Hide challenge indicator for {} ({})", event->achievement->id, event->achievement->title);
+
+  const auto lock = GetOverlayLock();
+  const auto it =
+    std::ranges::find_if(s_state.active_challenge_indicators,
                          [event](const ActiveChallengeIndicator& it) { return it.achievement == event->achievement; });
   if (it == s_state.active_challenge_indicators.end())
     return;
-
-  DEV_LOG("Hide challenge indicator for {} ({})", event->achievement->id, event->achievement->title);
 
   if (g_settings.achievements_challenge_indicator_mode == AchievementChallengeIndicatorMode::Notification &&
       event->achievement->state == RC_CLIENT_ACHIEVEMENT_STATE_ACTIVE)
@@ -1723,6 +1785,8 @@ void Achievements::HandleAchievementProgressIndicatorShowEvent(const rc_client_e
   DEV_LOG("Showing progress indicator: {} ({}): {}", event->achievement->id, event->achievement->title,
           event->achievement->measured_progress);
 
+  const auto lock = GetOverlayLock();
+
   // Don't show pinned achievements.
   if (IsAchievementPinned(event->achievement->id))
   {
@@ -1735,6 +1799,7 @@ void Achievements::HandleAchievementProgressIndicatorShowEvent(const rc_client_e
 
   s_state.active_progress_indicator->achievement = event->achievement;
   s_state.active_progress_indicator->badge_url = GetAchievementBadgeURL(event->achievement, false);
+  s_state.active_progress_indicator->mesaured_progress = event->achievement->measured_progress;
   s_state.active_progress_indicator->time = 0.0f;
   s_state.active_progress_indicator->active = true;
   FullscreenUI::UpdateAchievementsLastProgressUpdate(event->achievement);
@@ -1742,10 +1807,12 @@ void Achievements::HandleAchievementProgressIndicatorShowEvent(const rc_client_e
 
 void Achievements::HandleAchievementProgressIndicatorHideEvent(const rc_client_event_t* event)
 {
+  DEV_LOG("Hiding progress indicator");
+
+  const auto lock = GetOverlayLock();
+
   if (!s_state.active_progress_indicator.has_value())
     return;
-
-  DEV_LOG("Hiding progress indicator");
 
   s_state.active_progress_indicator->active = false;
   s_state.active_progress_indicator->time = std::min(s_state.active_progress_indicator->time, INDICATOR_FADE_OUT_TIME);
@@ -1755,10 +1822,14 @@ void Achievements::HandleAchievementProgressIndicatorUpdateEvent(const rc_client
 {
   DEV_LOG("Updating progress indicator: {} ({}): {}", event->achievement->id, event->achievement->title,
           event->achievement->measured_progress);
+
+  const auto lock = GetOverlayLock();
+
   if (!s_state.active_progress_indicator.has_value())
     return;
 
   s_state.active_progress_indicator->achievement = event->achievement;
+  s_state.active_progress_indicator->mesaured_progress = event->achievement->measured_progress;
   s_state.active_progress_indicator->active = true;
   FullscreenUI::UpdateAchievementsLastProgressUpdate(event->achievement);
 }
@@ -1793,14 +1864,15 @@ void Achievements::HandleServerReconnectedEvent(const rc_client_event_t* event)
                           TRANSLATE_STR("Achievements", "All pending unlock requests have completed."));
 }
 
-void Achievements::EnableHardcoreMode(bool display_message, bool display_game_summary)
+void Achievements::SetHardcoreModeState(bool enabled, bool display_message, bool display_game_summary)
 {
   DebugAssert(IsActive());
-  if (rc_client_get_hardcore_enabled(s_state.client))
+
+  if ((rc_client_get_hardcore_enabled(s_state.client) != 0) == enabled)
     return;
 
-  rc_client_set_hardcore_enabled(s_state.client, true);
-  OnHardcoreModeChanged(true, display_message, display_game_summary);
+  rc_client_set_hardcore_enabled(s_state.client, enabled);
+  OnHardcoreModeChanged(enabled, display_message, display_game_summary);
 }
 
 void Achievements::DisableHardcoreMode(bool show_message, bool display_game_summary)
@@ -1809,11 +1881,7 @@ void Achievements::DisableHardcoreMode(bool show_message, bool display_game_summ
     return;
 
   const auto lock = GetLock();
-  if (!rc_client_get_hardcore_enabled(s_state.client))
-    return;
-
-  rc_client_set_hardcore_enabled(s_state.client, false);
-  OnHardcoreModeChanged(false, show_message, display_game_summary);
+  SetHardcoreModeState(false, show_message, display_game_summary);
 }
 
 void Achievements::OnHardcoreModeChanged(bool enabled, bool display_message, bool display_game_summary)
@@ -1840,16 +1908,14 @@ void Achievements::OnHardcoreModeChanged(bool enabled, bool display_message, boo
     // Defer settings update in case something is using it.
     Host::RunOnCoreThread([]() { System::ApplySettings(false); });
   }
-  else if (System::GetState() == System::State::Starting)
-  {
-    // Initial HC enable, activate restrictions.
-    System::ApplySettings(false);
-  }
 
   // Toss away UI state, because it's invalid now
-  FullscreenUI::ClearAchievementsState();
+  {
+    const auto lock = GetOverlayLock();
+    FullscreenUI::ClearAchievementsState();
+  }
 
-  if (HasActiveGame() && display_game_summary)
+  if (s_state.game_id.load(std::memory_order_relaxed) != 0 && display_game_summary) // has active game
   {
     UpdateGameSummary();
     DisplayAchievementSummary();
@@ -1858,21 +1924,26 @@ void Achievements::OnHardcoreModeChanged(bool enabled, bool display_message, boo
   Host::OnAchievementsHardcoreModeChanged(enabled);
 }
 
-void Achievements::LoadStateFromBuffer(std::span<const u8> data, std::unique_lock<std::recursive_mutex>& lock)
+void Achievements::LoadStateFromBuffer(std::span<const u8> data, std::unique_lock<Threading::Mutex>& lock)
 {
   // if we're active, make sure we've downloaded and activated all the achievements
   // before deserializing, otherwise that state's going to get lost.
   // need to check for login requests too, because game load won't be created until login finishes
   if (s_state.load_game_request || s_state.login_request)
   {
+    // GetGamePath() can call GetGameID(), lock needs to be released first.
+    lock.unlock();
+
     // Fallback to game icon if we don't have a cover.
     std::string image = System::GetImageForLoadingScreen(System::GetGamePath());
     FullscreenUI::OpenOrUpdateLoadingScreen(image.empty() ? s_state.game_badge_url : image,
                                             TRANSLATE_SV("Achievements", "Downloading achievements data..."));
 
-    WaitForServerCallsWithYield(lock);
+    WaitForServerCalls();
 
     FullscreenUI::CloseLoadingScreen();
+
+    lock.lock();
   }
 
   if (data.empty())
@@ -2196,7 +2267,7 @@ u32 Achievements::GetPauseThrottleFrames()
     return 0;
 
   const auto lock = GetLock();
-  if (!IsHardcoreModeActive())
+  if (!rc_client_get_hardcore_enabled(s_state.client))
     return 0;
 
   u32 frames_remaining = 0;
@@ -2218,10 +2289,10 @@ void Achievements::Logout()
 
   if (IsActive())
   {
-    if (HasActiveGame())
+    if (s_state.game_id.load(std::memory_order_relaxed) != 0)
     {
       ClearGameInfo();
-      DisableHardcoreMode(false, false);
+      SetHardcoreModeState(false, false, false);
     }
 
     CancelFetchGameListRequest();
@@ -2864,7 +2935,8 @@ bool Achievements::CreateGameDatabaseFromSeedDatabase(Error* error)
 
 void Achievements::UpdateGameDatabaseFromCurrentGame()
 {
-  if (s_state.game_id == 0 || !s_state.game_hash.has_value() || !EnsureAchievementsDatabaseOpen())
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  if (game_id == 0 || !s_state.game_hash.has_value() || !EnsureAchievementsDatabaseOpen())
     return;
 
   // update hash
@@ -2885,9 +2957,9 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
     return;
   }
 
-  if (step != SQLITE_ROW || static_cast<u32>(stmt.ColumnInt(0)) != s_state.game_id)
+  if (step != SQLITE_ROW || static_cast<u32>(stmt.ColumnInt(0)) != game_id)
   {
-    INFO_LOG("Updating game ID for hash {} to {} in database", GameHashToString(s_state.game_hash), s_state.game_id);
+    INFO_LOG("Updating game ID for hash {} to {} in database", GameHashToString(s_state.game_hash), game_id);
     if (!stmt.Prepare(
           s_state.achievements_db,
           "INSERT INTO hashes (hash, game_id) VALUES (?, ?) ON CONFLICT(hash) DO UPDATE SET game_id=excluded.game_id;",
@@ -2899,7 +2971,7 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
 
     stmt.Reset();
     stmt.BindBlob(1, s_state.game_hash.value());
-    stmt.BindInt(2, static_cast<int>(s_state.game_id));
+    stmt.BindInt(2, static_cast<int>(game_id));
     if (!stmt.Execute(s_state.achievements_db, &error))
     {
       ERROR_LOG("Failed to execute hash update statement: {}", error.GetDescription());
@@ -2938,7 +3010,7 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
     return;
   }
 
-  stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  stmt.BindInt(1, static_cast<int>(game_id));
   step = stmt.Step();
   if (step != SQLITE_DONE && step != SQLITE_ROW)
   {
@@ -2965,7 +3037,7 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
     const int db_points = stmt.ColumnInt(4);
 #endif
 
-    INFO_LOG("Updating game details for game ID {} ({}) in database", s_state.game_id, ginfo_title);
+    INFO_LOG("Updating game details for game ID {} ({}) in database", game_id, ginfo_title);
 
     stmt.Reset();
     if (!stmt.Prepare(s_state.achievements_db,
@@ -2979,7 +3051,7 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
       return;
     }
 
-    stmt.BindInt(1, static_cast<int>(s_state.game_id));
+    stmt.BindInt(1, static_cast<int>(game_id));
     stmt.BindText(2, ginfo_title);
     stmt.BindText(3, ginfo_badge_url);
     stmt.BindInt(4, static_cast<int>(gsummary.num_core_achievements));
@@ -2993,7 +3065,7 @@ void Achievements::UpdateGameDatabaseFromCurrentGame()
   }
   else
   {
-    DEV_LOG("No update needed for game ID {} ({}) in database", s_state.game_id, ginfo_title);
+    DEV_LOG("No update needed for game ID {} ({}) in database", game_id, ginfo_title);
   }
 }
 
@@ -3188,7 +3260,8 @@ bool Achievements::WriteAllProgressToDatabase(const rc_client_all_user_progress_
 void Achievements::UpdateProgressDatabaseFromCurrentGame()
 {
   // don't write updates in spectator mode
-  if (s_state.game_id == 0 || rc_client_get_spectator_mode_enabled(s_state.client))
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  if (game_id == 0 || rc_client_get_spectator_mode_enabled(s_state.client))
     return;
 
   // query list to get both hardcore and softcore counts
@@ -3218,8 +3291,8 @@ void Achievements::UpdateProgressDatabaseFromCurrentGame()
   // update the game list, this should be fairly quick
   if (s_state.game_hash.has_value())
   {
-    Host::RunOnCoreThread([game_hash = s_state.game_hash.value(), game_id = s_state.game_id, num_achievements,
-                           achievements_unlocked, achievements_unlocked_hardcore]() {
+    Host::RunOnCoreThread([game_hash = s_state.game_hash.value(), game_id, num_achievements, achievements_unlocked,
+                           achievements_unlocked_hardcore]() {
       GameList::UpdateAchievementData(game_hash, game_id, num_achievements, achievements_unlocked,
                                       achievements_unlocked_hardcore);
     });
@@ -3230,19 +3303,14 @@ void Achievements::UpdateProgressDatabaseFromCurrentGame()
   // TODO: Is this true?
   if ((achievements_unlocked > 0 || achievements_unlocked_hardcore > 0) && EnsureAchievementsDatabaseOpen())
   {
-    s_state.update_progress_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+    s_state.update_progress_stmt.BindInt(1, static_cast<int>(game_id));
     s_state.update_progress_stmt.BindInt(2, static_cast<int>(achievements_unlocked));
     s_state.update_progress_stmt.BindInt(3, static_cast<int>(achievements_unlocked_hardcore));
 
     if (Error error; !s_state.update_progress_stmt.Execute(s_state.achievements_db, &error))
-    {
-      ERROR_LOG("Failed to upsert progress entry for game {}: {}", s_state.game_id, error.GetDescription());
-    }
+      ERROR_LOG("Failed to upsert progress entry for game {}: {}", game_id, error.GetDescription());
     else
-    {
-      INFO_LOG("Updated game {} with {}/{} unlocked", s_state.game_id, achievements_unlocked,
-               achievements_unlocked_hardcore);
-    }
+      INFO_LOG("Updated game {} with {}/{} unlocked", game_id, achievements_unlocked, achievements_unlocked_hardcore);
 
     s_state.update_progress_stmt.Reset();
   }
@@ -3263,7 +3331,8 @@ void Achievements::ClearProgressDatabase()
 
 void Achievements::LoadUnofficialAchievementUnlocks()
 {
-  if (!g_settings.achievements_track_unofficial || IsUsingRAIntegration() || s_state.game_id == 0 ||
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  if (!g_settings.achievements_track_unofficial || IsUsingRAIntegration() || game_id == 0 ||
       !EnsureAchievementsDatabaseOpen())
   {
     return;
@@ -3280,7 +3349,7 @@ void Achievements::LoadUnofficialAchievementUnlocks()
     return;
   }
 
-  query_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  query_stmt.BindInt(1, static_cast<int>(game_id));
   u32 loaded_count = 0;
   for (;;)
   {
@@ -3319,7 +3388,7 @@ void Achievements::LoadUnofficialAchievementUnlocks()
         continue;
       }
 
-      delete_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+      delete_stmt.BindInt(1, static_cast<int>(game_id));
       delete_stmt.BindInt(2, static_cast<int>(achievement_id));
       if (!delete_stmt.Execute(s_state.achievements_db, &error))
       {
@@ -3327,7 +3396,7 @@ void Achievements::LoadUnofficialAchievementUnlocks()
         continue;
       }
 
-      INFO_LOG("Removed stale unofficial achievement unlock {} for game {}", achievement_id, s_state.game_id);
+      INFO_LOG("Removed stale unofficial achievement unlock {} for game {}", achievement_id, game_id);
       continue;
     }
     else if (result != RC_OK)
@@ -3339,13 +3408,15 @@ void Achievements::LoadUnofficialAchievementUnlocks()
     loaded_count++;
   }
 
-  INFO_LOG("Restored {} unofficial achievement unlocks for game {}", loaded_count, s_state.game_id);
+  INFO_LOG("Restored {} unofficial achievement unlocks for game {}", loaded_count, game_id);
 }
 
 bool Achievements::StoreUnofficialAchievementUnlockInDatabase(const rc_client_achievement_t* achievement)
 {
+  // Really shouldn't be here without a game ID...
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
   DebugAssert(achievement && achievement->category == RC_CLIENT_ACHIEVEMENT_CATEGORY_UNOFFICIAL);
-  if (!achievement || s_state.game_id == 0 || !EnsureAchievementsDatabaseOpen())
+  if (game_id == 0 || !EnsureAchievementsDatabaseOpen())
     return false;
 
   Error error;
@@ -3361,7 +3432,7 @@ bool Achievements::StoreUnofficialAchievementUnlockInDatabase(const rc_client_ac
     ERROR_LOG("Failed to prepare existing unofficial achievement query: {}", error.GetDescription());
     return false;
   }
-  query_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  query_stmt.BindInt(1, static_cast<int>(game_id));
   query_stmt.BindInt(2, static_cast<int>(achievement->id));
   const int query_result = query_stmt.Step();
   if (query_result == SQLITE_ROW)
@@ -3401,7 +3472,7 @@ bool Achievements::StoreUnofficialAchievementUnlockInDatabase(const rc_client_ac
     return false;
   }
 
-  upsert_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  upsert_stmt.BindInt(1, static_cast<int>(game_id));
   upsert_stmt.BindInt(2, static_cast<int>(achievement->id));
   upsert_stmt.BindInt(3, achievement->unlocked);
   upsert_stmt.BindInt64(4, static_cast<s64>(unlock_time_softcore));
@@ -3413,7 +3484,7 @@ bool Achievements::StoreUnofficialAchievementUnlockInDatabase(const rc_client_ac
   }
 
   INFO_LOG("Stored unofficial achievement {} unlock state {} for game {}", achievement->id, achievement->unlocked,
-           s_state.game_id);
+           game_id);
   return true;
 }
 
@@ -3432,7 +3503,8 @@ void Achievements::ClearUnofficialAchievementUnlocksDatabase()
 void Achievements::ResetUnofficialAchievementUnlock(u32 achievement_id)
 {
   const auto lock = GetLock();
-  if (IsUsingRAIntegration() || !HasActiveGame() || !EnsureAchievementsDatabaseOpen())
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  if (IsUsingRAIntegration() || game_id == 0 || !EnsureAchievementsDatabaseOpen())
     return;
 
   const rc_client_achievement_t* achievement = rc_client_get_achievement_info(s_state.client, achievement_id);
@@ -3451,7 +3523,7 @@ void Achievements::ResetUnofficialAchievementUnlock(u32 achievement_id)
     ERROR_LOG("Failed to prepare unofficial achievement reset: {}", error.GetDescription());
     return;
   }
-  delete_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  delete_stmt.BindInt(1, static_cast<int>(game_id));
   delete_stmt.BindInt(2, static_cast<int>(achievement_id));
   if (!delete_stmt.Execute(s_state.achievements_db, &error))
   {
@@ -3468,13 +3540,14 @@ void Achievements::ResetUnofficialAchievementUnlock(u32 achievement_id)
   }
 
   UpdateGameSummary();
-  INFO_LOG("Reset unofficial achievement {} for game {}", achievement_id, s_state.game_id);
+  INFO_LOG("Reset unofficial achievement {} for game {}", achievement_id, game_id);
 }
 
 void Achievements::ResetAllUnofficialAchievementUnlocks()
 {
   const auto lock = GetLock();
-  if (IsUsingRAIntegration() || s_state.game_id == 0 || !EnsureAchievementsDatabaseOpen())
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  if (IsUsingRAIntegration() || game_id == 0 || !EnsureAchievementsDatabaseOpen())
     return;
 
   Error error;
@@ -3485,7 +3558,7 @@ void Achievements::ResetAllUnofficialAchievementUnlocks()
     ERROR_LOG("Failed to prepare unofficial achievement resets: {}", error.GetDescription());
     return;
   }
-  delete_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  delete_stmt.BindInt(1, static_cast<int>(game_id));
   if (!delete_stmt.Execute(s_state.achievements_db, &error))
   {
     ERROR_LOG("Failed to delete unofficial achievement unlocks: {}", error.GetDescription());
@@ -3519,7 +3592,7 @@ void Achievements::ResetAllUnofficialAchievementUnlocks()
   }
 
   UpdateGameSummary();
-  INFO_LOG("Reset {} unofficial achievements for game {}", achievement_ids.size(), s_state.game_id);
+  INFO_LOG("Reset {} unofficial achievements for game {}", achievement_ids.size(), game_id);
 }
 
 Achievements::ProgressDatabase::ProgressDatabase() = default;
@@ -3667,7 +3740,10 @@ void Achievements::LoadPinnedAchievements()
     return;
   }
 
-  query_stmt.BindInt(1, static_cast<int>(s_state.game_id));
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
+  query_stmt.BindInt(1, static_cast<int>(game_id));
+
+  std::vector<PinnedAchievementIndicator> new_indicators;
 
   for (;;)
   {
@@ -3700,15 +3776,17 @@ void Achievements::LoadPinnedAchievements()
     PinnedAchievementIndicator indicator;
     indicator.achievement_id = achievement_id;
     indicator.badge_url = GetAchievementBadgeURL(achievement, false);
-    s_state.pinned_achievement_indicators.push_back(std::move(indicator));
+    new_indicators.push_back(std::move(indicator));
   }
 
-  std::sort(s_state.pinned_achievement_indicators.begin(), s_state.pinned_achievement_indicators.end(),
-            [](const PinnedAchievementIndicator& lhs, const PinnedAchievementIndicator& rhs) {
-              return (lhs.achievement_id < rhs.achievement_id);
-            });
+  std::ranges::sort(new_indicators, [](const PinnedAchievementIndicator& lhs, const PinnedAchievementIndicator& rhs) {
+    return (lhs.achievement_id < rhs.achievement_id);
+  });
 
-  DEV_LOG("Loaded {} pinned achievements for game {}", s_state.pinned_achievement_indicators.size(), s_state.game_id);
+  DEV_LOG("Loaded {} pinned achievements for game {}", new_indicators.size(), game_id);
+
+  const auto overlay_lock = GetOverlayLock();
+  s_state.pinned_achievement_indicators = std::move(new_indicators);
 }
 
 bool Achievements::IsAchievementPinned(u32 achievement_id)
@@ -3768,13 +3846,14 @@ void Achievements::SetAchievementPinnedInDatabase(u32 achievement_id, bool pinne
   if (!EnsureAchievementsDatabaseOpen())
     return;
 
+  const u32 game_id = s_state.game_id.load(std::memory_order_relaxed);
   Error error;
   SQLitePreparedStatement stmt;
   if (pinned)
   {
     if (!stmt.Prepare(s_state.achievements_db,
                       "INSERT INTO pinned_achievements (game_id, achievement_id) VALUES (?, ?)", &error) ||
-        !(stmt.BindInt(1, static_cast<int>(s_state.game_id)), stmt.BindInt(2, static_cast<int>(achievement_id)),
+        !(stmt.BindInt(1, static_cast<int>(game_id)), stmt.BindInt(2, static_cast<int>(achievement_id)),
           stmt.Execute(s_state.achievements_db, &error)))
     {
       ERROR_LOG("Failed to pin achievement in database: {}", error.GetDescription());
@@ -3784,7 +3863,7 @@ void Achievements::SetAchievementPinnedInDatabase(u32 achievement_id, bool pinne
   {
     if (!stmt.Prepare(s_state.achievements_db,
                       "DELETE FROM pinned_achievements WHERE game_id = ? AND achievement_id = ?", &error) ||
-        !(stmt.BindInt(1, static_cast<int>(s_state.game_id)), stmt.BindInt(2, static_cast<int>(achievement_id)),
+        !(stmt.BindInt(1, static_cast<int>(game_id)), stmt.BindInt(2, static_cast<int>(achievement_id)),
           stmt.Execute(s_state.achievements_db, &error)))
     {
       ERROR_LOG("Failed to unpin achievement in database: {}", error.GetDescription());
@@ -3899,7 +3978,7 @@ void Achievements::FinishLoadRAIntegrationOnCoreThread()
   FinishInitialize();
 }
 
-void Achievements::UnloadRAIntegration(std::unique_lock<std::recursive_mutex>& lock)
+void Achievements::UnloadRAIntegration(std::unique_lock<Threading::Mutex>& lock)
 {
   DebugAssert(s_state.using_raintegration && s_state.client);
 

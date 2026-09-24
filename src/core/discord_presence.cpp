@@ -11,6 +11,7 @@
 #include "common/error.h"
 #include "common/log.h"
 #include "common/string_util.h"
+#include "common/threading.h"
 
 #include "discord_rpc.h"
 
@@ -108,8 +109,11 @@ bool DiscordPresence::Initialize()
 
   INFO_LOG("Discord Rich Presence initialized successfully");
 
-  if (const auto lock = Achievements::GetLock(); Achievements::HasActiveGame())
+  if (Achievements::HasActiveGame())
+  {
+    const auto lock = Achievements::GetLock();
     UpdateDetails(Achievements::GetCurrentGameBadgeURL(), Achievements::GetRichPresenceString());
+  }
 
   Update(true);
   return true;

@@ -29,22 +29,23 @@ AudioSettingsWidget::AudioSettingsWidget(SettingsWindow* dialog, QWidget* parent
                                                &CoreAudioStream::ParseStretchMode, &CoreAudioStream::GetStretchModeName,
                                                &CoreAudioStream::GetStretchModeDisplayName,
                                                AudioStreamParameters::DEFAULT_STRETCH_MODE, AudioStretchMode::Count);
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.bufferMS, "Audio", "BufferMS",
-                                              AudioStreamParameters::DEFAULT_BUFFER_MS);
-  QtUtils::BindLabelToSlider(m_ui.bufferMS, m_ui.bufferMSLabel, 1.0f, tr("%1 ms"));
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.outputLatencyMS, "Audio", "OutputLatencyMS",
-                                              AudioStreamParameters::DEFAULT_OUTPUT_LATENCY_MS);
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.bufferMS, m_ui.bufferMSLabel, m_ui.resetBufferSize,
+                                                      "Audio", "BufferMS", AudioStreamParameters::DEFAULT_BUFFER_MS,
+                                                      tr(" ms"));
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.outputLatencyMS, m_ui.outputLatencyLabel,
+                                                      m_ui.resetOutputLatency, "Audio", "OutputLatencyMS",
+                                                      AudioStreamParameters::DEFAULT_OUTPUT_LATENCY_MS, tr(" ms"));
   SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.outputLatencyMinimal, "Audio", "OutputLatencyMinimal",
                                                AudioStreamParameters::DEFAULT_OUTPUT_LATENCY_MINIMAL);
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.sequenceLength, "Audio", "StretchSequenceLengthMS",
-                                              AudioStreamParameters::DEFAULT_STRETCH_SEQUENCE_LENGTH, 0);
-  QtUtils::BindLabelToSlider(m_ui.sequenceLength, m_ui.sequenceLengthLabel, 1.0f, tr("%1 ms"));
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.seekWindowSize, "Audio", "StretchSeekWindowMS",
-                                              AudioStreamParameters::DEFAULT_STRETCH_SEEKWINDOW, 0);
-  QtUtils::BindLabelToSlider(m_ui.seekWindowSize, m_ui.seekWindowSizeLabel, 1.0f, tr("%1 ms"));
-  SettingWidgetBinder::BindWidgetToIntSetting(sif, m_ui.overlap, "Audio", "StretchOverlapMS",
-                                              AudioStreamParameters::DEFAULT_STRETCH_OVERLAP, 0);
-  QtUtils::BindLabelToSlider(m_ui.overlap, m_ui.overlapLabel, 1.0f, tr("%1 ms"));
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(
+    sif, m_ui.sequenceLength, m_ui.sequenceLengthLabel, m_ui.resetSequenceLength, "Audio", "StretchSequenceLengthMS",
+    AudioStreamParameters::DEFAULT_STRETCH_SEQUENCE_LENGTH, tr(" ms"));
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.seekWindowSize, m_ui.seekWindowSizeLabel,
+                                                      m_ui.resetSeekWindowSize, "Audio", "StretchSeekWindowMS",
+                                                      AudioStreamParameters::DEFAULT_STRETCH_SEEKWINDOW, tr(" ms"));
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.overlap, m_ui.overlapLabel, m_ui.resetOverlap, "Audio",
+                                                      "StretchOverlapMS",
+                                                      AudioStreamParameters::DEFAULT_STRETCH_OVERLAP, tr(" ms"));
   SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useQuickSeek, "Audio", "StretchUseQuickSeek",
                                                AudioStreamParameters::DEFAULT_STRETCH_USE_QUICKSEEK);
   SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.useAAFilter, "Audio", "StretchUseAAFilter",
@@ -53,42 +54,33 @@ AudioSettingsWidget::AudioSettingsWidget(SettingsWindow* dialog, QWidget* parent
 
   connect(m_ui.audioBackend, &QComboBox::currentIndexChanged, this, &AudioSettingsWidget::updateDriverNames);
   connect(m_ui.stretchMode, &QComboBox::currentIndexChanged, this, &AudioSettingsWidget::onStretchModeChanged);
-  connect(m_ui.outputLatencyMS, &QSlider::valueChanged, this, &AudioSettingsWidget::updateLatencyLabel);
-  connect(m_ui.outputLatencyMinimal, &QCheckBox::checkStateChanged, this,
-          [this]() { onMinimalOutputLatencyToggled(); });
+  connect(m_ui.outputLatencyMS, &QSlider::valueChanged, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
+  connect(m_ui.outputLatencyMinimal, &QCheckBox::checkStateChanged, this, &AudioSettingsWidget::onMinimalOutputLatencyToggled);
   connect(m_ui.bufferMS, &QSlider::valueChanged, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
+  connect(m_ui.resetOutputLatency, &QPushButton::clicked, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
   connect(m_ui.sequenceLength, &QSlider::valueChanged, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
+  connect(m_ui.resetBufferSize, &QPushButton::clicked, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
+  connect(m_ui.resetSequenceLength, &QPushButton::clicked, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
 
   updateDriverNames();
   onStretchModeChanged();
   onMinimalOutputLatencyToggled(); // also calls updateLatencyLabel()
 
-  // for per-game, just use the normal path, since it needs to re-read/apply
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.volume, m_ui.volumeLabel, m_ui.resetVolume, "Audio",
+                                                      "OutputVolume", 100, tr("%"));
+  SettingWidgetBinder::BindSliderAndLabelToIntSetting(sif, m_ui.fastForwardVolume, m_ui.fastForwardVolumeLabel,
+                                                      m_ui.resetFastForwardVolume, "Audio", "FastForwardVolume", 100,
+                                                      tr("%"));
+
   if (!dialog->isPerGameSettings())
   {
-    m_ui.volume->setValue(m_dialog->getEffectiveIntValue("Audio", "OutputVolume", 100));
-    m_ui.fastForwardVolume->setValue(m_dialog->getEffectiveIntValue("Audio", "FastForwardVolume", 100));
     m_ui.muted->setChecked(m_dialog->getEffectiveBoolValue("Audio", "OutputMuted", false));
-    connect(m_ui.volume, &QSlider::valueChanged, this, &AudioSettingsWidget::onOutputVolumeChanged);
-    connect(m_ui.fastForwardVolume, &QSlider::valueChanged, this, &AudioSettingsWidget::onFastForwardVolumeChanged);
     connect(m_ui.muted, &QCheckBox::checkStateChanged, this, &AudioSettingsWidget::onOutputMutedChanged);
-    updateVolumeLabel();
   }
   else
   {
-    SettingWidgetBinder::BindWidgetAndLabelToIntSetting(sif, m_ui.volume, m_ui.volumeLabel, tr("%"), "Audio",
-                                                        "OutputVolume", 100);
-    SettingWidgetBinder::BindWidgetAndLabelToIntSetting(sif, m_ui.fastForwardVolume, m_ui.fastForwardVolumeLabel,
-                                                        tr("%"), "Audio", "FastForwardVolume", 100);
     SettingWidgetBinder::BindWidgetToBoolSetting(sif, m_ui.muted, "Audio", "OutputMuted", false);
   }
-  connect(m_ui.resetVolume, &QPushButton::clicked, this, [this]() { resetVolume(false); });
-  connect(m_ui.resetFastForwardVolume, &QPushButton::clicked, this, [this]() { resetVolume(true); });
-  connect(m_ui.resetBufferSize, &QPushButton::clicked, this, &AudioSettingsWidget::onResetBufferSizeClicked);
-  connect(m_ui.resetSequenceLength, &QPushButton::clicked, this,
-          &AudioSettingsWidget::onResetStretchSequenceLengthClicked);
-  connect(m_ui.resetSeekWindowSize, &QPushButton::clicked, this, &AudioSettingsWidget::onResetStretchSeekWindowClicked);
-  connect(m_ui.resetOverlap, &QPushButton::clicked, this, &AudioSettingsWidget::onResetStretchOverlapClicked);
 
   dialog->registerWidgetHelp(
     m_ui.audioBackend, tr("Audio Backend"), QStringLiteral("Cubeb"),
@@ -271,20 +263,6 @@ void AudioSettingsWidget::queueUpdateDeviceNames()
   });
 }
 
-void AudioSettingsWidget::updateLatencyLabel()
-{
-  const bool minimal_output_latency = m_dialog->getEffectiveBoolValue(
-    "Audio", "OutputLatencyMinimal", AudioStreamParameters::DEFAULT_OUTPUT_LATENCY_MINIMAL);
-  const int config_output_latency_ms =
-    minimal_output_latency ?
-      0 :
-      m_dialog->getEffectiveIntValue("Audio", "OutputLatencyMS", AudioStreamParameters::DEFAULT_OUTPUT_LATENCY_MS);
-
-  m_ui.outputLatencyLabel->setText(minimal_output_latency ? tr("N/A") : tr("%1 ms").arg(config_output_latency_ms));
-
-  updateMinimumLatencyLabel();
-}
-
 void AudioSettingsWidget::updateMinimumLatencyLabel()
 {
   const AudioStretchMode stretch_mode =
@@ -344,39 +322,14 @@ void AudioSettingsWidget::updateMinimumLatencyLabel()
   }
 }
 
-void AudioSettingsWidget::updateVolumeLabel()
-{
-  m_ui.volumeLabel->setText(tr("%1%").arg(m_ui.volume->value()));
-  m_ui.fastForwardVolumeLabel->setText(tr("%1%").arg(m_ui.fastForwardVolume->value()));
-}
-
 void AudioSettingsWidget::onMinimalOutputLatencyToggled()
 {
   const bool minimal = m_dialog->getEffectiveBoolValue("Audio", "OutputLatencyMinimal", false);
   m_ui.outputLatencyMS->setEnabled(!minimal);
-  updateLatencyLabel();
-}
+  m_ui.outputLatencyLabel->setEnabled(!minimal);
+  m_ui.resetOutputLatency->setEnabled(!minimal);
 
-void AudioSettingsWidget::onOutputVolumeChanged(int new_value)
-{
-  // only called for base settings
-  DebugAssert(!m_dialog->isPerGameSettings());
-  Core::SetBaseIntSettingValue("Audio", "OutputVolume", new_value);
-  Host::CommitBaseSettingChanges();
-  g_core_thread->setAudioOutputVolume(new_value, m_ui.fastForwardVolume->value());
-
-  updateVolumeLabel();
-}
-
-void AudioSettingsWidget::onFastForwardVolumeChanged(int new_value)
-{
-  // only called for base settings
-  DebugAssert(!m_dialog->isPerGameSettings());
-  Core::SetBaseIntSettingValue("Audio", "FastForwardVolume", new_value);
-  Host::CommitBaseSettingChanges();
-  g_core_thread->setAudioOutputVolume(m_ui.volume->value(), new_value);
-
-  updateVolumeLabel();
+  updateMinimumLatencyLabel();
 }
 
 void AudioSettingsWidget::onOutputMutedChanged(int new_state)
@@ -388,85 +341,4 @@ void AudioSettingsWidget::onOutputMutedChanged(int new_state)
   Core::SetBaseBoolSettingValue("Audio", "OutputMuted", muted);
   Host::CommitBaseSettingChanges();
   g_core_thread->setAudioOutputMuted(muted);
-}
-
-void AudioSettingsWidget::resetVolume(bool fast_forward)
-{
-  const char* key = fast_forward ? "FastForwardVolume" : "OutputVolume";
-  QSlider* const slider = fast_forward ? m_ui.fastForwardVolume : m_ui.volume;
-  QLabel* const label = fast_forward ? m_ui.fastForwardVolumeLabel : m_ui.volumeLabel;
-
-  if (m_dialog->isPerGameSettings())
-  {
-    m_dialog->removeSettingValue("Audio", key);
-
-    const int value = m_dialog->getEffectiveIntValue("Audio", key, 100);
-    QSignalBlocker sb(slider);
-    slider->setValue(value);
-    label->setText(QStringLiteral("%1%2").arg(value).arg(tr("%")));
-
-    // remove bold font if it was previously overridden
-    QFont font(label->font());
-    font.setBold(false);
-    label->setFont(font);
-  }
-  else
-  {
-    slider->setValue(100);
-  }
-}
-
-void AudioSettingsWidget::onResetBufferSizeClicked()
-{
-  m_dialog->setIntSettingValue(
-    "Audio", "BufferMS",
-    m_dialog->isPerGameSettings() ? std::nullopt : std::optional<int>(AudioStreamParameters::DEFAULT_BUFFER_MS));
-  SettingWidgetBinder::DisconnectWidget(m_ui.bufferMS);
-  SettingWidgetBinder::BindWidgetToIntSetting(m_dialog->getSettingsInterface(), m_ui.bufferMS, "Audio", "BufferMS",
-                                              AudioStreamParameters::DEFAULT_BUFFER_MS);
-  QtUtils::BindLabelToSlider(m_ui.bufferMS, m_ui.bufferMSLabel, 1.0f, tr("%1 ms"));
-  connect(m_ui.bufferMS, &QSlider::valueChanged, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
-  updateMinimumLatencyLabel();
-}
-
-void AudioSettingsWidget::onResetStretchSequenceLengthClicked()
-{
-  m_dialog->setIntSettingValue("Audio", "StretchSequenceLengthMS",
-                               m_dialog->isPerGameSettings() ?
-                                 std::nullopt :
-                                 std::optional<int>(AudioStreamParameters::DEFAULT_STRETCH_SEQUENCE_LENGTH));
-
-  SettingWidgetBinder::DisconnectWidget(m_ui.sequenceLength);
-  SettingWidgetBinder::BindWidgetToIntSetting(m_dialog->getSettingsInterface(), m_ui.sequenceLength, "Audio",
-                                              "StretchSequenceLengthMS",
-                                              AudioStreamParameters::DEFAULT_STRETCH_SEQUENCE_LENGTH, 0);
-  QtUtils::BindLabelToSlider(m_ui.sequenceLength, m_ui.sequenceLengthLabel, 1.0f, tr("%1 ms"));
-  connect(m_ui.sequenceLength, &QSlider::valueChanged, this, &AudioSettingsWidget::updateMinimumLatencyLabel);
-  updateMinimumLatencyLabel();
-}
-
-void AudioSettingsWidget::onResetStretchSeekWindowClicked()
-{
-  m_dialog->setIntSettingValue("Audio", "StretchSeekWindowMS",
-                               m_dialog->isPerGameSettings() ?
-                                 std::nullopt :
-                                 std::optional<int>(AudioStreamParameters::DEFAULT_STRETCH_SEEKWINDOW));
-
-  SettingWidgetBinder::DisconnectWidget(m_ui.seekWindowSize);
-  SettingWidgetBinder::BindWidgetToIntSetting(m_dialog->getSettingsInterface(), m_ui.seekWindowSize, "Audio",
-                                              "StretchSeekWindowMS", AudioStreamParameters::DEFAULT_STRETCH_SEEKWINDOW,
-                                              0);
-  QtUtils::BindLabelToSlider(m_ui.seekWindowSize, m_ui.seekWindowSizeLabel, 1.0f, tr("%1 ms"));
-}
-
-void AudioSettingsWidget::onResetStretchOverlapClicked()
-{
-  m_dialog->setIntSettingValue(
-    "Audio", "StretchOverlapMS",
-    m_dialog->isPerGameSettings() ? std::nullopt : std::optional<int>(AudioStreamParameters::DEFAULT_STRETCH_OVERLAP));
-
-  SettingWidgetBinder::DisconnectWidget(m_ui.overlap);
-  SettingWidgetBinder::BindWidgetToIntSetting(m_dialog->getSettingsInterface(), m_ui.overlap, "Audio",
-                                              "StretchOverlapMS", AudioStreamParameters::DEFAULT_STRETCH_OVERLAP, 0);
-  QtUtils::BindLabelToSlider(m_ui.overlap, m_ui.overlapLabel, 1.0f, tr("%1 ms"));
 }

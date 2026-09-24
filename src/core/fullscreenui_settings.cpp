@@ -2505,8 +2505,13 @@ void FullscreenUI::PopulateImageTrackList()
   s_settings_locals.image_track_list.clear();
   s_settings_locals.image_track_summary.clear();
 
-  if (!s_settings_locals.game_settings_entry || s_settings_locals.game_settings_entry->is_runtime_populated)
+  // Don't populate tracks when we're running from disc, because the core might have exclusive access.
+  if (!s_settings_locals.game_settings_entry ||
+      (s_settings_locals.game_settings_entry->is_runtime_populated &&
+       CDImage::IsDeviceName(s_settings_locals.game_settings_entry->path.c_str())))
+  {
     return;
+  }
 
   std::unique_ptr<CDImage> image = CDImage::Open(s_settings_locals.game_settings_entry->path.c_str(), false, nullptr);
   if (!image)
@@ -3076,8 +3081,11 @@ void FullscreenUI::DrawCoverDownloaderWindow()
                      FSUI_CSTR("In the form below, specify the URLs to download covers from, with one template URL "
                                "per line. The following variables are available:"));
   ImGui::NewLine();
-  ImGui::TextWrapped("%s", FSUI_CSTR("${title}: Title of the game.\n${filetitle}: Name component of the game's "
-                                     "filename.\n${serial}: Serial of the game."));
+  ImGui::TextWrapped("%s", FSUI_CSTR("${title}: Title of the game."));
+  ImGui::TextWrapped("%s", FSUI_CSTR("${savetitle}: Save title for the game, including the region suffix."));
+  ImGui::TextWrapped("%s", FSUI_CSTR("${localizedtitle}: Localized title for the game in its native language."));
+  ImGui::TextWrapped("%s", FSUI_CSTR("${filetitle}: Name component of the game's filename."));
+  ImGui::TextWrapped("%s", FSUI_CSTR("${serial}: Serial of the game."));
   ImGui::NewLine();
   ImGui::TextWrapped("%s", FSUI_CSTR("Example: https://www.example-not-a-real-domain.com/covers/${serial}.jpg"));
   ImGui::NewLine();
@@ -3102,6 +3110,8 @@ void FullscreenUI::DrawCoverDownloaderWindow()
 
   if (HorizontalMenuButton(FSUI_ICONSTR(ICON_FA_DOWNLOAD, "Start Download"), download_enabled))
   {
+    SaveCoverDownloaderURLs();
+
     // TODO: Remove release once using move_only_function
     std::unique_ptr<ProgressCallback> progress = OpenModalProgressDialog(FSUI_STR("Cover Downloader"), 1000.0f);
     Host::QueueAsyncTask([progress = progress.release(),
@@ -3127,10 +3137,7 @@ void FullscreenUI::DrawCoverDownloaderWindow()
         Host::RunOnCoreThread([]() {
           VideoThread::RunOnThread([]() {
             if (IsFixedPopupDialogOpen(COVER_DOWNLOADER_DIALOG_NAME))
-            {
-              SaveCoverDownloaderURLs();
               CloseFixedPopupDialog();
-            }
           });
         });
       }

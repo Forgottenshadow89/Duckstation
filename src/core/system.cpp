@@ -596,12 +596,7 @@ void System::ChangeExeOverrideAndReset(std::string path)
 
 std::string System::GetGameIconPath(bool allow_achievements_badge)
 {
-  u32 achievements_game_id = 0;
-  if (allow_achievements_badge)
-  {
-    const auto lock = Achievements::GetLock();
-    achievements_game_id = Achievements::GetGameID();
-  }
+  u32 achievements_game_id = allow_achievements_badge ? Achievements::GetGameID() : 0;
 
   const auto lock = GameList::GetLock();
   return GameList::GetGameIconPath((s_state.running_game_custom_title || !s_state.running_game_entry) ?
@@ -1752,7 +1747,8 @@ System::BootResult System::BootSystem(SystemBootParameters parameters, Error* er
   FullscreenUI::OnSystemStarting();
   Achievements::OnSystemStarting(parameters.disable_achievements_hardcore_mode);
 
-  // Update running game, this will apply settings as well.
+  // Also reapplies settings after OnSystemStarting(), so newly-enabled hardcore-mode restrictions
+  // are picked up before Initialize().
   UpdateRunningGame(disc ? disc->GetPath() : parameters.path, disc.get(), true);
 
   // Determine console region. Has to be done here, because gamesettings can override it.
@@ -4300,9 +4296,12 @@ bool System::PopulateGameListEntryFromCurrentGame(GameList::Entry* entry, Error*
                        ((s_state.region == ConsoleRegion::NTSC_J) ? DiscRegion::NTSC_J : DiscRegion::PAL));
   }
 
-  entry->achievements_game_id = Achievements::GetGameID();
-  if (const std::optional<Achievements::GameHash> achievements_hash = Achievements::GetGameHash())
-    entry->achievements_hash = achievements_hash.value();
+  {
+    const auto lock = Achievements::GetLock();
+    entry->achievements_game_id = Achievements::GetGameID();
+    if (const std::optional<Achievements::GameHash> achievements_hash = Achievements::GetGameHash())
+      entry->achievements_hash = achievements_hash.value();
+  }
   entry->is_runtime_populated = true;
 
   return true;
@@ -4664,6 +4663,7 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
              g_settings.display_line_start_offset != old_settings.display_line_start_offset ||
              g_settings.display_line_end_offset != old_settings.display_line_end_offset ||
              g_settings.gpu_show_vram != old_settings.gpu_show_vram ||
+             g_settings.debug_window_visibility != old_settings.debug_window_visibility ||
              g_settings.rewind_enable != old_settings.rewind_enable ||
              g_settings.runahead_frames != old_settings.runahead_frames ||
              g_settings.texture_replacements != old_settings.texture_replacements)
@@ -4749,11 +4749,6 @@ void System::CheckForSettingsChanges(const Settings& old_settings)
         // don't need to represent here, because the OSD isn't visible while paused anyway
         VideoThread::UpdateSettings(true, false, false);
       }
-    }
-    else
-    {
-      // still need to update debug windows
-      VideoThread::UpdateSettings(false, false, false);
     }
 
     if (g_settings.gpu_widescreen_hack != old_settings.gpu_widescreen_hack ||

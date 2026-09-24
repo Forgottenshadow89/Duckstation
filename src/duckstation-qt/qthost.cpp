@@ -812,10 +812,11 @@ void QtHost::DownloadFile(QWidget* parent, std::string url, std::string path,
       bool result = false;
       HTTPDownloader::CreateRequest(
         std::move(url), parent,
-        [&result, &error, &path](s32 status_code, Error& http_error, std::string&, std::vector<u8>& hdata) {
+        [&result, &error, &path](s32 status_code, std::string_view http_error, std::string_view content_type,
+                                 std::vector<u8> hdata) {
           if (status_code != HTTPDownloader::HTTP_STATUS_OK)
           {
-            error.SetString(http_error.GetDescription());
+            error.SetStringView(http_error);
             return;
           }
           else if (hdata.empty())
@@ -1814,20 +1815,6 @@ void CoreThread::undoLoadState()
   }
 
   System::UndoLoadState();
-}
-
-void CoreThread::setAudioOutputVolume(int volume, int fast_forward_volume)
-{
-  if (!isCurrentThread())
-  {
-    QMetaObject::invokeMethod(this, &CoreThread::setAudioOutputVolume, Qt::QueuedConnection, volume,
-                              fast_forward_volume);
-    return;
-  }
-
-  g_settings.audio_output_volume = static_cast<u8>(volume);
-  g_settings.audio_fast_forward_volume = static_cast<u8>(fast_forward_volume);
-  System::UpdateVolume();
 }
 
 void CoreThread::setAudioOutputMuted(bool muted)
